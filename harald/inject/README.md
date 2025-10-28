@@ -28,7 +28,13 @@ Base Prompt Embeds + α × Residual → Qwen-Image → Generated Image
 The POC runs on modal.com as configured in `harald/modal_runner.py`:
 
 ```bash
-# Full workflow (training + inference)
+# Minimal example for fast testing (1 seed, recommended)
+modal run -m harald.modal_runner::injection_poc \
+  --seed-dirs /mnt/dataset/8/seed_2816178403 \
+  --train \
+  --epochs 5
+
+# Full workflow with multiple seeds (training + inference)
 modal run -m harald.modal_runner::injection_poc \
   --seed-dirs /mnt/dataset/8/seed_2816178403,/mnt/dataset/8/seed_1461687847,/mnt/dataset/8/seed_2732585231 \
   --train \
@@ -36,23 +42,18 @@ modal run -m harald.modal_runner::injection_poc \
 
 # Inference only (requires pre-trained checkpoint)
 modal run -m harald.modal_runner::injection_poc \
-  --seed-dirs /mnt/dataset/8/seed_2816178403,/mnt/dataset/8/seed_1461687847
+  --seed-dirs /mnt/dataset/8/seed_2816178403
 
 # Custom parameters
 modal run -m harald.modal_runner::injection_poc \
-  --seed-dirs /mnt/dataset/8/seed_2816178403,/mnt/dataset/8/seed_1461687847 \
+  --seed-dirs /mnt/dataset/8/seed_2816178403 \
   --train \
   --epochs 3 \
-  --batch-size 2 \
+  --batch-size 1 \
   --lr 1e-3 \
-  --alphas "0.5,1.0,1.5,2.0" \
+  --alphas "0.0,0.5,1.0,1.5" \
   --gen-seeds "1234,5678,9999" \
   --base-prompt "a portrait photo of a person, studio lighting, 85mm"
-
-# Minimal example (using defaults)
-modal run -m harald.modal_runner::injection_poc \
-  --seed-dirs /mnt/dataset/8/seed_2816178403,/mnt/dataset/8/seed_1461687847 \
-  --train
 ```
 
 **Important Notes:**
