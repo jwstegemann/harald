@@ -4,14 +4,18 @@ Wir feintunen ein Qwen3-VL (https://github.com/QwenLM/Qwen3-VL) so, dass es aus 
 
 Laufzeitumgebung ist modal.com . Die einzelnen Anwendungen werden über harald/modal_runner.py gestartet: z.B. `modal run -m harald.modal_runner::injection_poc`
 
-
 ---
 
 ## 1) Projekt-Annahmen & Goldene Regeln
 
+- **Modelle:** Verwende https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct und die Standard-Version von Qwen-Image, die QwenImagePipeline lädt.
+- **Parameter:** stets über konstanten im Code abbilden (keine cli-parameter verwenden, keine config-files.)
+- **APIs korrekt verwenden**: Nutze die Online-Doku (https://huggingface.co/docs/diffusers/main/api/pipelines/qwenimage) und Source von diffusers (https://raw.githubusercontent.com/huggingface/diffusers/84e16575e4c5e90b6b49301cfa162ced4cf478d2/src/diffusers/pipelines/qwenimage/pipeline_qwenimage.py), um Aufrufe der API korrekt zu bauen. Triff keine Annahmen und rate nicht. Deine Informationen dazu sind veraltet. Doku zur Verwendung von Qwen-VL findest Du unter https://github.com/QwenLM/Qwen3-VL .
 - **Repo & venv existieren.** `harald/config.py` ist die _Single Source of Truth_ für Modal-/Runtime-Objekte, Versionen und Volumes.
 - **Determinismus:** Gleiches Seed ⇒ gleiche Outputs (Train/Infer).
 - **CIDA/GPU:** Utilize device CIDA and the GPU whereever possible. The code does not have to run on machines without CIDA.
+- **Klare Fehlermeldungen und Abbruch:** verwende nie graceful degradation, wenn Dinge nicht funktionieren wie geplant. Gib deutliche Fehlermeldungen aus und brich ab, damit wir darauf reagieren können.
+- **Logging und Metriken**: schreibe metriken in eine json-datei pro Lauf. logge key-metriken parallel auch auf stdout (loss im training, etc.)
 - **modal.com:** Alle aufrufbaren Funktionen werden als modal.com remote functions implementiert. Aufrufschema siehe unten. Dateien, die gelesen werden müssen, werden per volume zur Verfügung gestellt. Modelle (Comic-Style-LoRA) auf dem HF_CACHE. Führe alle Tests auf modal.com aud, wie unten in "Jobs & Tests ausführen" gezeigt.
 - **huggingface:** Beim Laden von Modelle, Pipelines, etc. über Huggingface nutze verpflichtend immer `token = hf_token` und `cache_dir=HF_CACHE`. Lies `hf_token` aus dem `HF_SECRET` falls noch nicht geschehen: `hf_token = os.environ.get("HUGGINGFACE_TOKEN")`
 

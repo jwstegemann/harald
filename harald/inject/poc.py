@@ -52,10 +52,14 @@ QWEN3_VL_MODEL = "Qwen/Qwen3-VL-4B-Instruct"
 QWEN_IMAGE_MODEL = "Qwen/Qwen-Image"
 
 # Default generation params (Qwen-Image recommended)
-DEFAULT_STEPS = 50
-DEFAULT_GUIDANCE = 1.0
+DEFAULT_STEPS = 30
+DEFAULT_GUIDANCE = 4.0
 DEFAULT_HEIGHT = 1024
 DEFAULT_WIDTH = 1024
+
+# Maximum sequence length for text embeddings
+# Use 256 to preserve caption details while staying memory-efficient
+MAX_SEQ_LEN = 256
 
 # ============================================================================
 # Utilities
@@ -420,12 +424,18 @@ class SinglePhotoDataset(Dataset):
 class PreExtractedFeaturesDataset(Dataset):
     """
     Dataset that works with pre-extracted features stored in memory.
-    This avoids needing the feature extractor model during training/inference.
+    Also includes caption texts for training.
     """
 
-    def __init__(self, features: dict[str, torch.Tensor], device: str = "cuda"):
+    def __init__(
+        self,
+        features: dict[str, torch.Tensor],
+        captions: dict[str, str],
+        device: str = "cuda",
+    ):
         super().__init__()
         self.features = features
+        self.captions = captions
         self.seed_names = list(features.keys())
         self.device = device
 
@@ -440,10 +450,12 @@ class PreExtractedFeaturesDataset(Dataset):
     def __getitem__(self, idx: int):
         seed_name = self.seed_names[idx]
         feat = self.features[seed_name]  # CPU tensor
+        caption = self.captions[seed_name]
 
         return {
             "feat": feat,  # Will be moved to GPU in training loop
             "seed_name": seed_name,
+            "caption": caption,
         }
 
 
@@ -531,11 +543,12 @@ def train_linear_head(
     head: LinearResidualHead,
     loader: DataLoader,
     base_prompt_embeds: torch.Tensor,
+    helper: QwenImageTextHelper,
     device: str = "cuda",
     epochs: int = 3,
     lr: float = 1e-3,
 ):
-    """Train the linear head with MSE + cosine loss."""
+    """Train the linear head to predict caption embeddings as residuals."""
     head.train()
     optimizer = torch.optim.AdamW(head.parameters(), lr=lr)
 
@@ -549,6 +562,7 @@ def train_linear_head(
 
         for batch in pbar:
             feat = batch["feat"].to(device)
+            captions = batch["caption"]  # List of caption strings
 
             # Predict residual
             pred_residual = head(feat)  # [batch, seq_len, hidden_dim]
@@ -558,10 +572,77 @@ def train_linear_head(
                 print(f"\nERROR: NaN in pred_residual at step {step}, skipping batch")
                 continue
 
-            # Target: zero residual (we're learning identity representation)
-            # In a full implementation, this would be caption embeddings - base embeddings
-            # For POC, we train to predict small residuals
-            target_residual = torch.zeros_like(pred_residual)
+            # Encode captions to get target embeddings
+            # Use MAX_SEQ_LEN to preserve caption details (not truncate to short base prompt)
+            # Process each caption in batch
+            caption_embeds_list = []
+            for caption in captions:
+                cap_embeds, _ = helper.encode_text(
+                    caption, max_sequence_length=MAX_SEQ_LEN
+                )
+                caption_embeds_list.append(cap_embeds)
+
+            # Stack and move to device
+            caption_embeds = torch.cat(caption_embeds_list, dim=0).to(device)
+
+            # Align sequence lengths by padding (preserve all information, no truncation)
+            base_seq_len = base_prompt_embeds.shape[1]
+            caption_seq_len = caption_embeds.shape[1]
+            target_seq_len = max(base_seq_len, caption_seq_len)
+
+            # Pad base_prompt_embeds if needed
+            if base_seq_len < target_seq_len:
+                padding = torch.zeros(
+                    base_prompt_embeds.shape[0],
+                    target_seq_len - base_seq_len,
+                    base_prompt_embeds.shape[2],
+                    device=base_prompt_embeds.device,
+                    dtype=base_prompt_embeds.dtype,
+                )
+                base_prompt_embeds = torch.cat([base_prompt_embeds, padding], dim=1)
+                print(
+                    f"[DEBUG] Padded base_prompt from {base_seq_len} to {target_seq_len} tokens"
+                )
+
+            # Pad caption_embeds if needed
+            if caption_seq_len < target_seq_len:
+                padding = torch.zeros(
+                    caption_embeds.shape[0],
+                    target_seq_len - caption_seq_len,
+                    caption_embeds.shape[2],
+                    device=caption_embeds.device,
+                    dtype=caption_embeds.dtype,
+                )
+                caption_embeds = torch.cat([caption_embeds, padding], dim=1)
+                print(
+                    f"[DEBUG] Padded caption from {caption_seq_len} to {target_seq_len} tokens"
+                )
+
+            # Debug: Print shapes after alignment
+            print(f"[DEBUG] Final caption_embeds shape: {caption_embeds.shape}")
+            print(f"[DEBUG] Final base_prompt_embeds shape: {base_prompt_embeds.shape}")
+
+            # Target: residual from base to caption embeddings
+            # Now both have same sequence length!
+            target_residual = caption_embeds - base_prompt_embeds
+
+            # Pad pred_residual to match target_residual if needed
+            # (LinearResidualHead has fixed output size from initialization)
+            pred_seq_len = pred_residual.shape[1]
+            target_seq_len = target_residual.shape[1]
+
+            if pred_seq_len < target_seq_len:
+                padding = torch.zeros(
+                    pred_residual.shape[0],
+                    target_seq_len - pred_seq_len,
+                    pred_residual.shape[2],
+                    device=pred_residual.device,
+                    dtype=pred_residual.dtype,
+                )
+                pred_residual = torch.cat([pred_residual, padding], dim=1)
+                print(
+                    f"[DEBUG] Padded pred_residual from {pred_seq_len} to {target_seq_len} tokens"
+                )
 
             # MSE loss only (cosine similarity with zero targets is numerically unstable)
             loss = F.mse_loss(pred_residual, target_residual)
@@ -907,19 +988,20 @@ def parse_args() -> Args:
 def extract_all_features(
     seed_dirs: List[str],
     feature_extractor: Qwen3VLFeatureExtractor,
-) -> dict[str, torch.Tensor]:
+) -> tuple[dict[str, torch.Tensor], dict[str, str]]:
     """
-    Extract visual features from all seed directories and store in CPU memory.
-    This allows us to free GPU memory before loading the generative model.
+    Extract visual features and load captions from all seed directories.
+    Store in CPU memory to free GPU before loading generative model.
 
     Returns:
-        Dict mapping seed_name → feature tensor (on CPU)
+        Tuple of (features dict, captions dict) mapping seed_name → feature/caption
     """
     print("\n" + "=" * 80)
-    print("PHASE 1: FEATURE EXTRACTION")
+    print("PHASE 1: FEATURE EXTRACTION & CAPTION LOADING")
     print("=" * 80)
 
     features = {}
+    captions = {}
 
     for seed_dir in tqdm(seed_dirs, desc="Extracting features", ncols=100):
         if not os.path.isdir(seed_dir):
@@ -945,8 +1027,18 @@ def extract_all_features(
             print(f"WARNING: Invalid features for {seed_name}, skipping")
             continue
 
+        # Load caption from corresponding .txt file
+        caption_path = photo_path.replace(".png", ".txt")
+        if os.path.exists(caption_path):
+            with open(caption_path, "r", encoding="utf-8") as f:
+                caption = f.read().strip()
+        else:
+            print(f"WARNING: No caption file for {seed_name}, using default")
+            caption = "a portrait photo of a person"
+
         # Store on CPU to free GPU memory
         features[seed_name] = feat.cpu()
+        captions[seed_name] = caption
 
     print(f"\nExtracted features for {len(features)} identities")
 
@@ -960,7 +1052,8 @@ def extract_all_features(
         )
         print(f"  Min: {all_feats.min().item():.6f}, Max: {all_feats.max().item():.6f}")
 
-    return features
+    print(f"Loaded captions for {len(captions)} identities")
+    return features, captions
 
 
 def main():
@@ -1011,7 +1104,7 @@ def main():
     )
 
     # Extract all features and store in CPU memory
-    all_features = extract_all_features(args.seed_dirs, feature_extractor)
+    all_features, all_captions = extract_all_features(args.seed_dirs, feature_extractor)
 
     # Get feature dimension
     feat_dim = next(iter(all_features.values())).numel()
@@ -1059,9 +1152,13 @@ def main():
     print(f"Baseline image saved to: {baseline_path}")
     print("If this image is not black, the pipeline works!")
 
-    # Encode base prompts
-    print(f"\nEncoding base prompt: '{args.base_prompt}'")
-    base_embeds, base_mask = helper.encode_text(args.base_prompt)
+    # Encode base prompts with fixed max_sequence_length to preserve caption details
+    print(
+        f"\nEncoding base prompt with max_seq_len={MAX_SEQ_LEN}: '{args.base_prompt}'"
+    )
+    base_embeds, base_mask = helper.encode_text(
+        args.base_prompt, max_sequence_length=MAX_SEQ_LEN
+    )
     seq_len, hidden_dim = base_embeds.shape[1], base_embeds.shape[2]
     print(
         f"Base embeddings shape: {base_embeds.shape} (seq_len={seq_len}, hidden_dim={hidden_dim})"
@@ -1071,11 +1168,15 @@ def main():
     # Always use single space for negative prompt (Qwen-Image official example pattern)
     negative_prompt_text = " "
     print(f"Encoding negative prompt: '{negative_prompt_text}'")
-    neg_embeds, neg_mask = helper.encode_text(negative_prompt_text)
+    neg_embeds, neg_mask = helper.encode_text(
+        negative_prompt_text, max_sequence_length=MAX_SEQ_LEN
+    )
 
     # Create dataset from pre-extracted features
     print("\nCreating dataset from pre-extracted features...")
-    dataset = PreExtractedFeaturesDataset(all_features, device=args.device)
+    dataset = PreExtractedFeaturesDataset(
+        all_features, all_captions, device=args.device
+    )
 
     # Initialize linear head
     head = LinearResidualHead(feat_dim, seq_len, hidden_dim).to(
@@ -1106,6 +1207,7 @@ def main():
             head,
             loader,
             base_embeds.to(args.device),
+            helper,
             device=args.device,
             epochs=args.epochs,
             lr=args.lr,

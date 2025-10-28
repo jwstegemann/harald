@@ -278,3 +278,196 @@ def injection_poc(
     argv.extend(["--negative-prompt", negative_prompt])
 
     return _maybe_import_and_call("harald.inject.poc", "main", argv)
+
+
+@app.function(
+    gpu="H200",
+    timeout=86400,  # 24 hours
+    memory=32768,  # 32GB RAM
+    volumes=VOLUMES,
+    secrets=[HF_SECRET],
+)
+def run_phase0_to_phase2(
+    seed_dirs: str,  # comma-separated paths
+    base_prompt: str = "a portrait photo of ~ID~, studio lighting",
+    slot_string: str = "~ID~",
+    target_slot_length: int = 4,
+    steps: int = 600,
+    lr: float = 5e-3,
+    cfg_scale: float = 4.5,
+    batch_size: int = 2,
+    prefer_bf16: bool = True,
+    negative_prompt: str = " ",
+    alpha_qa_alphas: str = "0.5,1.0,1.5,2.0",
+    alpha_qa_seeds: str = "4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19",
+):
+    """
+    Run Phase 0-2: Environment check, minimal render test, and teacher inversion.
+
+    Args:
+        seed_dirs: Comma-separated paths to seed_* directories (required)
+        base_prompt: Base prompt with slot (default: "a portrait photo of ~ID~, studio lighting")
+        slot_string: Slot placeholder string (default: "~ID~")
+        target_slot_length: Target token length for slot (default: 4)
+        steps: Training steps per identity (default: 600)
+        lr: Learning rate (default: 5e-3)
+        cfg_scale: CFG scale for training (default: 4.5)
+        batch_size: Batch size for training (default: 2)
+        prefer_bf16: Prefer bfloat16 over float16 (default: True)
+        negative_prompt: Negative prompt (default: " " - empty)
+        alpha_qa_alphas: Comma-separated alpha values for QA (default: "0.5,1.0,1.5,2.0")
+        alpha_qa_seeds: Comma-separated seeds for QA (default: "4,5,...,19")
+
+    Example:
+        modal run -m harald.modal_runner::run_phase0_to_phase2 --seed-dirs "/mnt/dataset/0/seed_12345,/mnt/dataset/0/seed_67890"
+    """
+    _prep_runtime()
+
+    import os
+    import torch
+    from pathlib import Path
+
+    # Import our modules
+    from harald.phase0 import (
+        check_cuda_availability,
+        determine_dtype,
+        scan_dataset,
+        initialize_slot_config,
+    )
+    from harald.phase1 import test_minimal_render
+    from harald.phase2.runner import run_phase2_for_identities
+    from harald.models.qwen_image import QwenImagePipeline
+
+    # Parse arguments
+    seed_dir_list = [Path(d.strip()) for d in seed_dirs.split(",")]
+    alphas_list = [float(a.strip()) for a in alpha_qa_alphas.split(",")]
+    seeds_list = [int(s.strip()) for s in alpha_qa_seeds.split(",")]
+
+    print("\n" + "=" * 60)
+    print("HARALD: Phase 0-2 Pipeline")
+    print("=" * 60)
+    print(f"Seed directories: {len(seed_dir_list)}")
+    print(f"Base prompt:      '{base_prompt}'")
+    print(f"Slot string:      '{slot_string}'")
+    print(f"Target slot len:  {target_slot_length}")
+    print(f"Training steps:   {steps}")
+    print(f"Learning rate:    {lr}")
+    print(f"CFG scale:        {cfg_scale}")
+    print(f"Batch size:       {batch_size}")
+    print("=" * 60)
+    print()
+
+    # =========================================================================
+    # Phase 0: Environment & Specifications
+    # =========================================================================
+
+    print("\n" + "#" * 60)
+    print("# PHASE 0: Environment & Specifications")
+    print("#" * 60 + "\n")
+
+    # Check CUDA
+    cuda_info = check_cuda_availability()
+
+    # Determine dtype
+    dtype = determine_dtype(prefer_bf16=prefer_bf16)
+    device = torch.device("cuda")
+
+    # Load Qwen-Image pipeline
+    print("Loading Qwen-Image pipeline...")
+    hf_token = os.environ.get("HUGGINGFACE_TOKEN")
+    pipeline = QwenImagePipeline(
+        model_name="Qwen/Qwen-Image",
+        device=device,
+        dtype=dtype,
+        hf_token=hf_token,
+        cache_dir=str(HF_CACHE),
+    )
+
+    # Initialize slot config
+    slot_config = initialize_slot_config(
+        tokenizer=pipeline.tokenizer,
+        slot_string=slot_string,
+        target_length=target_slot_length,
+    )
+
+    # Note: We skip dataset scanning since user provides explicit seed_dirs
+    # If you want to scan base paths instead, uncomment:
+    # base_paths = ["/mnt/dataset/0", "/mnt/dataset/1"]
+    # seed_dir_list = scan_dataset(base_paths)
+
+    print("✓ Phase 0 complete.\n")
+
+    # =========================================================================
+    # Phase 1: Minimal Render Test
+    # =========================================================================
+
+    print("\n" + "#" * 60)
+    print("# PHASE 1: Minimal Render Test")
+    print("#" * 60 + "\n")
+
+    test_minimal_render(
+        pipeline=pipeline,
+        base_prompt=base_prompt,
+        slot_config=slot_config,
+        device=device,
+        dtype=dtype,
+        output_dir=Path("/mnt/output/phase1/"),
+    )
+
+    print("✓ Phase 1 complete.\n")
+
+    # =========================================================================
+    # Phase 2: Teacher Inversion
+    # =========================================================================
+
+    print("\n" + "#" * 60)
+    print("# PHASE 2: Teacher Inversion")
+    print("#" * 60 + "\n")
+
+    results = run_phase2_for_identities(
+        seed_dirs=seed_dir_list,
+        base_prompt=base_prompt,
+        output_dir=Path("/mnt/output/phase2/"),
+        pipeline=pipeline,
+        slot_config=slot_config,
+        device=device,
+        dtype=dtype,
+        steps=steps,
+        lr=lr,
+        cfg_scale=cfg_scale,
+        batch_size=batch_size,
+        negative_prompt=negative_prompt,
+        alpha_qa_alphas=alphas_list,
+        alpha_qa_seeds=seeds_list,
+    )
+
+    print("✓ Phase 2 complete.\n")
+
+    # =========================================================================
+    # Summary
+    # =========================================================================
+
+    print("\n" + "=" * 60)
+    print("PIPELINE COMPLETE")
+    print("=" * 60)
+    print(f"Total identities processed: {len(results)}")
+    print(f"Successful:                 {sum(1 for r in results if r.get('success', False))}")
+    print(f"Failed:                     {sum(1 for r in results if not r.get('success', False))}")
+    print()
+    print("Outputs:")
+    print("  Phase 1: /mnt/output/phase1/")
+    print("  Phase 2: /mnt/output/phase2/")
+    print("=" * 60)
+    print()
+
+    return {
+        "cuda_info": cuda_info,
+        "dtype": str(dtype),
+        "slot_config": {
+            "slot_string": slot_config.slot_string,
+            "T_slot": slot_config.T_slot,
+            "L": slot_config.L,
+            "s": slot_config.s,
+        },
+        "phase2_results": results,
+    }
