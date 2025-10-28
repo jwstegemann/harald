@@ -21,9 +21,17 @@ def validate_device_dtype(
 
     Raises:
         SystemExit: If any tensor has wrong device or dtype (hard fail)
+
+    Notes:
+        - Device comparison is normalized: cuda == cuda:0 == cuda:1 etc.
+        - Only device type (cuda/cpu/mps) is checked, not specific device index
     """
     for name, tensor in tensors.items():
-        if tensor.device != expected_device:
+        # Normalize device comparison: cuda == cuda:0, cuda:1, etc.
+        tensor_device_type = tensor.device.type
+        expected_device_type = expected_device.type
+
+        if tensor_device_type != expected_device_type:
             print(
                 f"ERROR: Tensor '{name}' has wrong device.\n"
                 f"  Expected: {expected_device}\n"

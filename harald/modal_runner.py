@@ -390,6 +390,23 @@ def run_phase0_to_phase2(
         target_length=target_slot_length,
     )
 
+    # Validate that base_prompt contains the selected slot_string
+    if slot_config.slot_string not in base_prompt:
+        print(
+            f"ERROR: Base prompt does not contain the selected slot string.\n"
+            f"  Base prompt:       '{base_prompt}'\n"
+            f"  Selected slot:     '{slot_config.slot_string}'\n"
+            f"  Requested slot:    '{slot_string}'\n"
+            f"\n"
+            f"Please update your base_prompt parameter to use '{slot_config.slot_string}'.\n"
+            f"  Example: --base-prompt \"a portrait photo of {slot_config.slot_string}, studio lighting\"",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"✓ Base prompt validated: contains slot '{slot_config.slot_string}'")
+    print()
+
     # Note: We skip dataset scanning since user provides explicit seed_dirs
     # If you want to scan base paths instead, uncomment:
     # base_paths = ["/mnt/dataset/0", "/mnt/dataset/1"]

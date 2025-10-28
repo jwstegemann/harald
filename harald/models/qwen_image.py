@@ -80,7 +80,8 @@ class QwenImagePipeline:
 
     def _validate_components(self):
         """Validate that pipeline has required components."""
-        required = ["tokenizer", "text_encoder", "unet", "vae", "scheduler"]
+        # Qwen-Image uses transformer (MMDiT) instead of unet
+        required = ["tokenizer", "text_encoder", "transformer", "vae", "scheduler"]
         missing = []
 
         for component in required:
@@ -105,9 +106,9 @@ class QwenImagePipeline:
         return self.pipe.text_encoder
 
     @property
-    def unet(self):
-        """Access UNet component."""
-        return self.pipe.unet
+    def transformer(self):
+        """Access Transformer (MMDiT) component."""
+        return self.pipe.transformer
 
     @property
     def vae(self):
@@ -213,12 +214,12 @@ class QwenImagePipeline:
             - Uses Qwen-Image specific parameter: true_cfg_scale
             - Generator device must match pipeline device
         """
-        # Validate prompt_embeds device/dtype
-        if prompt_embeds.device != self.device:
+        # Validate prompt_embeds device/dtype (normalize: cuda == cuda:0)
+        if prompt_embeds.device.type != self.device.type:
             print(
                 f"ERROR: prompt_embeds device mismatch.\n"
-                f"  Expected: {self.device}\n"
-                f"  Got:      {prompt_embeds.device}",
+                f"  Expected: {self.device} (type: {self.device.type})\n"
+                f"  Got:      {prompt_embeds.device} (type: {prompt_embeds.device.type})",
                 file=sys.stderr,
             )
             sys.exit(1)

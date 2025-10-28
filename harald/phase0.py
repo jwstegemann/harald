@@ -242,6 +242,20 @@ def initialize_slot_config(
         print("=" * 60)
         print()
 
+        # Warn if slot_string differs from preferred
+        if slot_config.slot_string != slot_string:
+            print()
+            print("!" * 60)
+            print("WARNING: Slot string was AUTO-SELECTED")
+            print("!" * 60)
+            print(f"  Requested:  '{slot_string}'")
+            print(f"  Selected:   '{slot_config.slot_string}'")
+            print()
+            print("IMPORTANT: Update your base_prompt to use the SELECTED slot string!")
+            print(f"  Example: 'a portrait photo of {slot_config.slot_string}, studio lighting'")
+            print("!" * 60)
+            print()
+
         return slot_config
 
     except ValueError as e:

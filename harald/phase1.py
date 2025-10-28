@@ -103,13 +103,24 @@ def test_minimal_render(
     print(f"  E_base device:     {E_base.device}")
     print(f"  E_base dtype:      {E_base.dtype}")
     print(f"  E_base_mask shape: {E_base_mask.shape}")
+    print(f"  E_base_mask dtype: {E_base_mask.dtype}")
 
-    # Validate device/dtype
+    # Validate device/dtype (embeddings only, mask is int64/bool)
     validate_device_dtype(
-        {"E_base": E_base, "E_base_mask": E_base_mask},
+        {"E_base": E_base},
         expected_device=device,
         expected_dtype=dtype,
     )
+
+    # Validate mask device (dtype can be int64 or bool)
+    if E_base_mask.device.type != device.type:
+        print(
+            f"ERROR: E_base_mask has wrong device.\n"
+            f"  Expected: {device}\n"
+            f"  Got:      {E_base_mask.device}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Validate shape (must be [1, S, H])
     if E_base.ndim != 3 or E_base.shape[0] != 1:
@@ -148,6 +159,10 @@ def test_minimal_render(
 
     # Step 4: Generate test images
     print("Step 4: Generating test images...")
+
+    # Encode negative prompt (required for CFG)
+    neg_embeds, neg_mask = pipeline.encode_negative_prompt(negative_prompt=" ")
+
     test_seeds = [0, 1]
     test_images = []
 
@@ -158,8 +173,8 @@ def test_minimal_render(
         img = pipeline.generate(
             prompt_embeds=E_inj,
             prompt_embeds_mask=E_base_mask,
-            negative_prompt_embeds=None,
-            negative_prompt_embeds_mask=None,
+            negative_prompt_embeds=neg_embeds,
+            negative_prompt_embeds_mask=neg_mask,
             num_inference_steps=20,  # Fewer steps for quick test
             guidance_scale=4.0,
             height=512,  # Smaller size for quick test
@@ -243,6 +258,9 @@ def test_alpha_sweep(
     # Create dummy residual
     R_dummy = torch.zeros(1, L, H, device=device, dtype=dtype)
 
+    # Encode negative prompt (required for CFG)
+    neg_embeds, neg_mask = pipeline.encode_negative_prompt(negative_prompt=" ")
+
     # Generate grid
     all_images = []
 
@@ -261,6 +279,8 @@ def test_alpha_sweep(
             img = pipeline.generate(
                 prompt_embeds=E_inj,
                 prompt_embeds_mask=E_base_mask,
+                negative_prompt_embeds=neg_embeds,
+                negative_prompt_embeds_mask=neg_mask,
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
                 height=height,

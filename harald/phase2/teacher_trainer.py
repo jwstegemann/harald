@@ -280,8 +280,8 @@ class TeacherInversionTrainer:
         E_expanded = E.expand(batch_size, -1, -1)
         E_mask_expanded = E_mask.expand(batch_size, -1)
 
-        # UNet forward (conditional)
-        model_pred_cond = self.pipeline.unet(
+        # Transformer forward (conditional)
+        model_pred_cond = self.pipeline.transformer(
             noisy_latents,
             timesteps,
             encoder_hidden_states=E_expanded,
@@ -295,7 +295,7 @@ class TeacherInversionTrainer:
             E_neg_expanded = self.E_neg.expand(batch_size, -1, -1)
             E_neg_mask_expanded = self.E_neg_mask.expand(batch_size, -1)
 
-            model_pred_uncond = self.pipeline.unet(
+            model_pred_uncond = self.pipeline.transformer(
                 noisy_latents,
                 timesteps,
                 encoder_hidden_states=E_neg_expanded,
@@ -668,6 +668,9 @@ class TeacherInversionTrainer:
 
         E_teacher = E_teacher.to(self.device, dtype=self.dtype)
 
+        # Encode negative prompt (required for CFG)
+        neg_embeds, neg_mask = self.pipeline.encode_negative_prompt(negative_prompt=" ")
+
         all_images = []
 
         for alpha in alphas:
@@ -684,6 +687,8 @@ class TeacherInversionTrainer:
                 img = self.pipeline.generate(
                     prompt_embeds=E_eval,
                     prompt_embeds_mask=self.E_base_mask,
+                    negative_prompt_embeds=neg_embeds,
+                    negative_prompt_embeds_mask=neg_mask,
                     num_inference_steps=num_inference_steps,
                     guidance_scale=guidance_scale,
                     height=height,
