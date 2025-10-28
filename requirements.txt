@@ -1,0 +1,23 @@
+# --- kompatible Trio für CUDA ≥12.1 ---
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
+numpy
+
+# --- aktuelle Libraries ---
+accelerate==0.34.0
+transformers>=4.53.0
+huggingface_hub
+git+https://github.com/huggingface/diffusers
+onnxruntime
+
+# --- Utils ---
+opencv-python-headless
+pillow
+scikit-image
+scikit-learn
+tqdm
+sentencepiece
+hf_transfer
+
+modal

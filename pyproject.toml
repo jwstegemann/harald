@@ -1,0 +1,30 @@
+#[tool.pyright]
+#venvPath = "."
+#venv = ".venv"
+#extraPaths = ["ComfyUI"]
+#exclude = ["backup"]
+
+[tool.ruff]
+exclude = [".venv", "venv", "__pycache__", "backup"]
+line-length = 88
+# TODO: Add when available: "E266", "E203"
+lint.ignore = ["E501", "E741", "E402"]
+lint.select = ['E', 'F', 'W', 'I']
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+known-third-party = ["modal"]
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu: marks tests as requiring GPU (deselect with '-m \"not gpu\"')",
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "huge: marks tests with many data",
+    "cpu: marks tests as CPU-only (no GPU required)",
+]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --strict-markers"
+filterwarnings = ["ignore::UserWarning", "ignore::DeprecationWarning"]
