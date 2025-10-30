@@ -281,7 +281,7 @@ def injection_poc(
 
 
 @app.function(
-    gpu="H200",
+    gpu="H100",
     timeout=86400,  # 24 hours
     memory=32768,  # 32GB RAM
     volumes=VOLUMES,
@@ -293,13 +293,13 @@ def run_phase0_to_phase2(
     slot_string: str = "~ID~",
     target_slot_length: int = 4,
     steps: int = 600,
-    lr: float = 5e-3,
-    cfg_scale: float = 4.5,
+    lr: float = 1e-4,
+    cfg_scale: float = 1.0,
     batch_size: int = 2,
     prefer_bf16: bool = True,
     negative_prompt: str = " ",
     alpha_qa_alphas: str = "0.5,1.0,1.5,2.0",
-    alpha_qa_seeds: str = "4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19",
+    alpha_qa_seeds: str = "4,5,6,7",
 ):
     """
     Run Phase 0-2: Environment check, minimal render test, and teacher inversion.
@@ -383,30 +383,15 @@ def run_phase0_to_phase2(
         cache_dir=str(HF_CACHE),
     )
 
-    # Initialize slot config
+    # Initialize slot config (context-based tokenization)
     slot_config = initialize_slot_config(
         tokenizer=pipeline.tokenizer,
         slot_string=slot_string,
+        base_prompt=base_prompt,
         target_length=target_slot_length,
     )
 
-    # Validate that base_prompt contains the selected slot_string
-    if slot_config.slot_string not in base_prompt:
-        print(
-            f"ERROR: Base prompt does not contain the selected slot string.\n"
-            f"  Base prompt:       '{base_prompt}'\n"
-            f"  Selected slot:     '{slot_config.slot_string}'\n"
-            f"  Requested slot:    '{slot_string}'\n"
-            f"\n"
-            f"Please update your base_prompt parameter to use '{slot_config.slot_string}'.\n"
-            f"  Example: --base-prompt \"a portrait photo of {slot_config.slot_string}, studio lighting\"",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    print(f"✓ Base prompt validated: contains slot '{slot_config.slot_string}'")
-    print()
-
+    # Note: Slot validation is done inside initialize_slot_config()
     # Note: We skip dataset scanning since user provides explicit seed_dirs
     # If you want to scan base paths instead, uncomment:
     # base_paths = ["/mnt/dataset/0", "/mnt/dataset/1"]
@@ -468,8 +453,12 @@ def run_phase0_to_phase2(
     print("PIPELINE COMPLETE")
     print("=" * 60)
     print(f"Total identities processed: {len(results)}")
-    print(f"Successful:                 {sum(1 for r in results if r.get('success', False))}")
-    print(f"Failed:                     {sum(1 for r in results if not r.get('success', False))}")
+    print(
+        f"Successful:                 {sum(1 for r in results if r.get('success', False))}"
+    )
+    print(
+        f"Failed:                     {sum(1 for r in results if not r.get('success', False))}"
+    )
     print()
     print("Outputs:")
     print("  Phase 1: /mnt/output/phase1/")

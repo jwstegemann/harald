@@ -18,12 +18,12 @@ def run_phase2_for_identities(
     device,
     dtype,
     steps: int = 600,
-    lr: float = 5e-3,
-    cfg_scale: float = 4.5,
+    lr: float = 1e-4,
+    cfg_scale: float = 1.0,
     batch_size: int = 2,
     negative_prompt: str = " ",
     alpha_qa_alphas: List[float] = [0.5, 1.0, 1.5, 2.0],
-    alpha_qa_seeds: List[int] = list(range(4, 20)),
+    alpha_qa_seeds: List[int] = list(range(4, 8)),
 ) -> List[Dict[str, Any]]:
     """
     Run Phase 2 teacher inversion for multiple identities.
@@ -78,13 +78,17 @@ def run_phase2_for_identities(
         print(f"Identity {i + 1}/{len(seed_dirs)}: {seed_dir.name}")
         print(f"{'=' * 60}\n")
 
-        # Find image files
+        # Find image files (photo_view_* only, not comic_view_*)
         image_files = []
         for ext in ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp"]:
-            image_files.extend(seed_dir.glob(ext))
+            # Filter for photo_view_* pattern
+            for img_file in seed_dir.glob(ext):
+                if img_file.name.startswith("photo_view_"):
+                    image_files.append(img_file)
 
         if len(image_files) < 2:
-            print(f"WARNING: {seed_dir} has <2 images. Skipping.")
+            print(f"WARNING: {seed_dir} has <2 photo_view_* images. Skipping.")
+            print(f"  Found {len(image_files)} photo_view_* images")
             continue
 
         # Take first 5 images (or all if <5)
@@ -137,8 +141,12 @@ def run_phase2_for_identities(
             print(f"✓ Identity {seed_dir.name} complete.\n")
 
         except Exception as e:
+            import traceback
             print(f"ERROR: Failed to process {seed_dir.name}")
             print(f"  {e}")
+            print()
+            print("Full traceback:")
+            traceback.print_exc()
             print()
 
             result = {

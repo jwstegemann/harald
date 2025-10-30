@@ -49,13 +49,13 @@ def tokenize_and_find_slot(
     Raises:
         ValueError: If slot not found in tokenized prompt
     """
-    # Tokenize with consistent settings
+    # Tokenize with consistent settings (no special tokens to match slot config)
     tokens = tokenizer(
         prompt,
         padding=padding,
         truncation=truncation,
         max_length=tokenizer.model_max_length,
-        add_special_tokens=True,  # Include [CLS], [SEP], etc.
+        add_special_tokens=False,  # Must match determine_slot_config()
         return_tensors=return_tensors,
     )
 
@@ -76,6 +76,17 @@ def tokenize_and_find_slot(
             i += 1
 
     if not positions:
+        # Debug: Show what tokens we actually got
+        import sys
+        print(
+            f"\nDEBUG: Slot search failed\n"
+            f"  Slot string:     '{slot_config.slot_string}'\n"
+            f"  Expected T_slot: {T_slot}\n"
+            f"  Prompt:          '{prompt}'\n"
+            f"  Token IDs:       {input_ids.tolist()[:50]}... (first 50)\n"
+            f"  add_special_tokens: False\n",
+            file=sys.stderr,
+        )
         raise ValueError(
             f"Slot '{slot_config.slot_string}' (T_slot={T_slot}) not found in prompt '{prompt}'. "
             f"Tokenizer version/config mismatch?"
@@ -107,57 +118,117 @@ def find_all_slot_positions(
     return [(s, slot_config.L) for s in positions]
 
 
-def determine_slot_config(
+def determine_slot_config_in_context(
     tokenizer,
-    target_length: int = 4,
-    candidate_strings: Optional[List[str]] = None,
+    slot_string: str,
+    base_prompt: str,
+    target_length: Optional[int] = None,
 ) -> SlotConfig:
     """
-    Determine a slot string that tokenizes to exactly target_length tokens.
+    Determine slot token sequence by analyzing tokenization in actual prompt context.
+
+    This solves the boundary-token problem: tokenizers like BPE may produce different
+    token IDs for a slot string depending on context (e.g., neighboring whitespace,
+    punctuation). By tokenizing the actual base_prompt with/without the slot, we
+    extract the exact token sequence as it appears in practice.
 
     Args:
         tokenizer: HuggingFace tokenizer
-        target_length: Desired token length (default: 4)
-        candidate_strings: List of candidate slot strings to try
-                          (default: ["~ID~", "~identity~", "~ID_token~", "~SLOT~"])
+        slot_string: The slot placeholder string (e.g., "~ID~" or "<ID_token>")
+        base_prompt: The actual prompt template containing the slot
+                     (e.g., "a portrait photo of ~ID~, studio lighting")
+        target_length: Optional expected token length for validation
 
     Returns:
-        SlotConfig for the first candidate that matches target_length
+        SlotConfig with token IDs as they appear in base_prompt context
 
     Raises:
-        ValueError: If no candidate produces target_length tokens
+        ValueError: If slot_string not found in base_prompt
+        ValueError: If extracted length != target_length (when specified)
+        ValueError: If token extraction fails (unable to locate insertion point)
+
+    Example:
+        >>> slot_config = determine_slot_config_in_context(
+        ...     tokenizer,
+        ...     slot_string="<ID_token>",
+        ...     base_prompt="a portrait photo of <ID_token>, studio lighting",
+        ...     target_length=4
+        ... )
+        >>> slot_config.T_slot  # Token IDs as they appear in the prompt
+        [3968, 915, 6458, 54497]
     """
-    if candidate_strings is None:
-        candidate_strings = ["~ID~", "~identity~", "~ID_token~", "~SLOT~"]
-
-    for candidate in candidate_strings:
-        # Tokenize without special tokens to get pure slot length
-        tokens = tokenizer(
-            candidate,
-            padding="max_length",
-            truncation=True,
-            max_length=tokenizer.model_max_length,
-            add_special_tokens=False,
-            return_tensors="pt",
+    # Validate slot in prompt
+    if slot_string not in base_prompt:
+        raise ValueError(
+            f"Slot string '{slot_string}' not found in base_prompt '{base_prompt}'"
         )
-        input_ids = tokens["input_ids"][0]
 
-        # Count non-padding tokens
-        pad_token_id = tokenizer.pad_token_id
-        if pad_token_id is None:
-            # If no pad token, all tokens are non-padding
-            non_pad_ids = input_ids
-        else:
-            non_pad_ids = input_ids[input_ids != pad_token_id]
-
-        L = len(non_pad_ids)
-
-        if L == target_length:
-            T_slot = non_pad_ids.tolist()
-            return SlotConfig(slot_string=candidate, T_slot=T_slot, L=L)
-
-    # No candidate matched
-    raise ValueError(
-        f"No slot string from {candidate_strings} tokenizes to exactly {target_length} tokens. "
-        f"Tokenizer: {tokenizer.__class__.__name__}, vocab_size={tokenizer.vocab_size}"
+    # Tokenize prompt without slot (replace with empty string)
+    prompt_without = base_prompt.replace(slot_string, "")
+    tokens_without = tokenizer(
+        prompt_without,
+        padding="max_length",
+        truncation=True,
+        max_length=tokenizer.model_max_length,
+        add_special_tokens=False,
+        return_tensors="pt",
     )
+    ids_without = tokens_without["input_ids"][0]
+
+    # Tokenize prompt with slot
+    tokens_with = tokenizer(
+        base_prompt,
+        padding="max_length",
+        truncation=True,
+        max_length=tokenizer.model_max_length,
+        add_special_tokens=False,
+        return_tensors="pt",
+    )
+    ids_with = tokens_with["input_ids"][0]
+
+    # Remove padding for cleaner comparison
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is not None:
+        ids_without = ids_without[ids_without != pad_token_id]
+        ids_with = ids_with[ids_with != pad_token_id]
+
+    # Find longest common prefix
+    prefix_len = 0
+    max_prefix = min(len(ids_without), len(ids_with))
+    while prefix_len < max_prefix and ids_with[prefix_len] == ids_without[prefix_len]:
+        prefix_len += 1
+
+    # Find longest common suffix
+    suffix_len = 0
+    max_suffix = min(len(ids_without), len(ids_with)) - prefix_len
+    while suffix_len < max_suffix and ids_with[-(suffix_len + 1)] == ids_without[-(suffix_len + 1)]:
+        suffix_len += 1
+
+    # Extract slot token sequence
+    slot_start = prefix_len
+    slot_end = len(ids_with) - suffix_len
+
+    if slot_start >= slot_end:
+        raise ValueError(
+            f"Failed to extract slot tokens from prompt.\n"
+            f"  Slot string: '{slot_string}'\n"
+            f"  Base prompt: '{base_prompt}'\n"
+            f"  Tokens without slot: {ids_without.tolist()}\n"
+            f"  Tokens with slot:    {ids_with.tolist()}\n"
+            f"  Prefix length: {prefix_len}, Suffix length: {suffix_len}"
+        )
+
+    T_slot = ids_with[slot_start:slot_end].tolist()
+    L = len(T_slot)
+
+    # Validate target length if specified
+    if target_length is not None and L != target_length:
+        raise ValueError(
+            f"Slot '{slot_string}' tokenizes to {L} tokens in context, "
+            f"but target_length={target_length} was specified.\n"
+            f"  Base prompt: '{base_prompt}'\n"
+            f"  Token IDs:   {T_slot}\n"
+            f"  Hint: Either adjust your slot string or change target_length."
+        )
+
+    return SlotConfig(slot_string=slot_string, T_slot=T_slot, L=L)

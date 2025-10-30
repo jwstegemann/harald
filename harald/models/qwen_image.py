@@ -64,6 +64,16 @@ class QwenImagePipeline:
             ).to(device)
 
             self.pipe.set_progress_bar_config(disable=True)
+
+            # Enable gradient flow through text encoder while keeping weights frozen
+            # 1. Freeze text_encoder parameters (no weight updates during training)
+            for param in self.pipe.text_encoder.parameters():
+                param.requires_grad_(False)
+
+            # 2. Set train() mode to allow gradient computation through activations
+            #    This enables embeddings to participate in autograd without updating encoder weights
+            self.pipe.text_encoder.train()
+
             print("Qwen-Image pipeline loaded successfully")
 
         except Exception as e:
@@ -129,7 +139,6 @@ class QwenImagePipeline:
         """
         return self.tokenizer.model_max_length
 
-    @torch.inference_mode()
     def encode_text(
         self,
         prompt: str,
@@ -179,7 +188,6 @@ class QwenImagePipeline:
 
         return prompt_embeds, prompt_embeds_mask
 
-    @torch.inference_mode()
     def generate(
         self,
         prompt_embeds: torch.Tensor,
@@ -230,33 +238,35 @@ class QwenImagePipeline:
             generator = torch.Generator(device=self.device).manual_seed(seed)
 
         # Generate image using prompt embeddings
-        try:
-            result = self.pipe(
-                prompt_embeds=prompt_embeds,
-                prompt_embeds_mask=prompt_embeds_mask,
-                negative_prompt_embeds=negative_prompt_embeds,
-                negative_prompt_embeds_mask=negative_prompt_embeds_mask,
-                true_cfg_scale=guidance_scale,  # Qwen-Image specific
-                num_inference_steps=num_inference_steps,
-                height=height,
-                width=width,
-                generator=generator,
-            )
+        # Use no_grad instead of inference_mode to allow lazy caches to be normal tensors
+        with torch.no_grad():
+            try:
+                result = self.pipe(
+                    prompt_embeds=prompt_embeds,
+                    prompt_embeds_mask=prompt_embeds_mask,
+                    negative_prompt_embeds=negative_prompt_embeds,
+                    negative_prompt_embeds_mask=negative_prompt_embeds_mask,
+                    true_cfg_scale=guidance_scale,  # Qwen-Image specific
+                    num_inference_steps=num_inference_steps,
+                    height=height,
+                    width=width,
+                    generator=generator,
+                )
 
-            img = result.images[0]
-            return img
+                img = result.images[0]
+                return img
 
-        except Exception as e:
-            print(
-                f"ERROR: Image generation failed.\n"
-                f"  prompt_embeds shape: {prompt_embeds.shape}\n"
-                f"  steps: {num_inference_steps}\n"
-                f"  guidance: {guidance_scale}\n"
-                f"  size: {height}x{width}\n"
-                f"  Error: {e}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            except Exception as e:
+                print(
+                    f"ERROR: Image generation failed.\n"
+                    f"  prompt_embeds shape: {prompt_embeds.shape}\n"
+                    f"  steps: {num_inference_steps}\n"
+                    f"  guidance: {guidance_scale}\n"
+                    f"  size: {height}x{width}\n"
+                    f"  Error: {e}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
     def encode_negative_prompt(
         self,

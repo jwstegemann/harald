@@ -60,7 +60,7 @@ class TeacherInversionTrainer:
         slot_config: SlotConfig,
         device: torch.device,
         dtype: torch.dtype,
-        cfg_scale: float = 4.5,
+        cfg_scale: float = 1.0,
         negative_prompt: str = " ",
     ):
         """
@@ -87,6 +87,11 @@ class TeacherInversionTrainer:
         print("Encoding base prompt...")
         self.E_base, self.E_base_mask = pipeline.encode_text(base_prompt)
 
+        # Clone to remove inference mode flag and enable gradient flow
+        # Without cloning, tensors retain inference flag from text_encoder
+        self.E_base = self.E_base.clone()
+        self.E_base_mask = self.E_base_mask.clone()
+
         # Find slot position in base prompt
         if slot_config.s is None:
             self._find_slot_position()
@@ -101,15 +106,49 @@ class TeacherInversionTrainer:
         # Encode negative prompt (fixed)
         self.E_neg, self.E_neg_mask = pipeline.encode_text(negative_prompt)
 
-        # Validate shapes
+        # Clone to remove inference mode flag
+        self.E_neg = self.E_neg.clone()
+        self.E_neg_mask = self.E_neg_mask.clone()
+
+        # Pad negative embeddings to match base prompt length if needed
+        if self.E_neg.shape[1] != self.E_base.shape[1]:
+            B, S_neg, H = self.E_neg.shape
+            S_base = self.E_base.shape[1]
+
+            if S_neg < S_base:
+                # Pad with zeros to match length
+                padding_length = S_base - S_neg
+                padding = torch.zeros(B, padding_length, H, device=self.E_neg.device, dtype=self.E_neg.dtype)
+                self.E_neg = torch.cat([self.E_neg, padding], dim=1)
+
+                # Pad mask with zeros (indicating padded positions)
+                mask_padding = torch.zeros(B, padding_length, device=self.E_neg_mask.device, dtype=self.E_neg_mask.dtype)
+                self.E_neg_mask = torch.cat([self.E_neg_mask, mask_padding], dim=1)
+
+                print(f"  ℹ Padded negative prompt embeddings: {S_neg} → {S_base} tokens")
+            else:
+                # Truncate if longer (unlikely but handle it)
+                self.E_neg = self.E_neg[:, :S_base, :]
+                self.E_neg_mask = self.E_neg_mask[:, :S_base]
+                print(f"  ℹ Truncated negative prompt embeddings: {S_neg} → {S_base} tokens")
+
+        # Final validation
         if self.E_neg.shape != self.E_base.shape:
             print(
-                f"ERROR: Negative prompt embeddings shape mismatch.\n"
+                f"ERROR: Negative prompt embeddings shape mismatch after padding.\n"
                 f"  E_base:  {self.E_base.shape}\n"
                 f"  E_neg:   {self.E_neg.shape}",
                 file=sys.stderr,
             )
             sys.exit(1)
+
+        # Enable gradient checkpointing to save memory
+        if hasattr(self.pipeline.transformer, "enable_gradient_checkpointing"):
+            self.pipeline.transformer.enable_gradient_checkpointing()
+            print("  ✓ Enabled gradient checkpointing on transformer")
+        elif hasattr(self.pipeline.transformer, "gradient_checkpointing_enable"):
+            self.pipeline.transformer.gradient_checkpointing_enable()
+            print("  ✓ Enabled gradient checkpointing on transformer")
 
         print(f"✓ Teacher trainer initialized")
         print(f"  Base prompt:   '{base_prompt}'")
@@ -117,6 +156,56 @@ class TeacherInversionTrainer:
         print(f"  Embeddings:    shape={self.E_base.shape}, device={self.device}, dtype={self.dtype}")
         print(f"  CFG scale:     {cfg_scale}")
         print()
+
+    def _pack_latents(
+        self, latents: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Pack latents from [B, C, H, W] to [B, num_patches, C*4] for transformer.
+
+        QwenImage transformer expects packed latents where each 2x2 spatial patch
+        is flattened into the channel dimension.
+
+        Args:
+            latents: VAE latents [B, C, H, W] (typically C=16)
+
+        Returns:
+            Packed latents [B, (H//2)*(W//2), C*4] (typically C*4=64)
+        """
+        from diffusers.pipelines.qwenimage.pipeline_qwenimage import QwenImagePipeline
+
+        batch_size, num_channels, height, width = latents.shape
+
+        return QwenImagePipeline._pack_latents(
+            latents,
+            batch_size=batch_size,
+            num_channels_latents=num_channels,
+            height=height,
+            width=width,
+        )
+
+    def _unpack_latents(
+        self, latents: torch.Tensor, height: int, width: int
+    ) -> torch.Tensor:
+        """
+        Unpack latents from [B, num_patches, 64] to [B, 16, H, W] for VAE.
+
+        Args:
+            latents: Packed latents [B, num_patches, 64]
+            height: Target height (must be divisible by 8)
+            width: Target width (must be divisible by 8)
+
+        Returns:
+            Unpacked latents [B, 16, H, W]
+        """
+        from diffusers.pipelines.qwenimage.pipeline_qwenimage import QwenImagePipeline
+
+        return QwenImagePipeline._unpack_latents(
+            latents,
+            height=height,
+            width=width,
+            vae_scale_factor=8,  # Standard VAE scale factor
+        )
 
     def _find_slot_position(self):
         """Find slot position in base prompt and update slot_config."""
@@ -142,7 +231,7 @@ class TeacherInversionTrainer:
     def prepare_images(
         self,
         image_paths: List[Path],
-        target_size: Tuple[int, int] = (768, 512),
+        target_size: Tuple[int, int] = (1024, 1024),
     ) -> torch.Tensor:
         """
         Prepare and cache image latents for training.
@@ -190,6 +279,11 @@ class TeacherInversionTrainer:
             img = img.resize(target_size, Image.Resampling.LANCZOS)
             images.append(img)
 
+        # Store image dimensions for img_shapes calculation in forward_step()
+        # target_size is (width, height) tuple
+        self.image_width = target_size[0]
+        self.image_height = target_size[1]
+
         # Convert to tensors
         import torchvision.transforms.functional as TF
 
@@ -197,13 +291,30 @@ class TeacherInversionTrainer:
         pixel_values = pixel_values * 2.0 - 1.0  # Normalize to [-1, 1]
         pixel_values = pixel_values.to(self.device, dtype=self.dtype)
 
+        # Add frame dimension for Qwen-Image video VAE: [N, 3, H, W] → [N, 3, 1, H, W]
+        # Qwen-Image VAE expects 5D tensor (batch, channels, frames, height, width)
+        pixel_values = pixel_values.unsqueeze(2)  # Insert frame dimension at position 2
+
         # Encode to latents
         print("Encoding images to latents...")
         with torch.no_grad():
-            latents = self.pipeline.vae.encode(pixel_values).latent_dist.sample()
-            latents = latents * self.pipeline.vae.config.scaling_factor
+            encoder_output = self.pipeline.vae.encode(pixel_values, return_dict=True)
+            latents = encoder_output.latent_dist.sample()
+            # Note: Qwen-Image VAE uses latents_mean/latents_std, not scaling_factor
+            # Latents are already normalized internally, no external scaling needed
 
-        print(f"  ✓ Cached {len(latents)} latents: {latents.shape}")
+            print(f"  Raw latents shape (5D): {latents.shape}")
+
+            # Remove frame dimension: [N, C, F, H, W] → [N, C, H, W]
+            # VAE outputs 5D tensor with frame dimension, but we need 4D for packing
+            latents = latents.squeeze(2)
+            print(f"  Squeezed latents shape (4D): {latents.shape}")
+
+            # Pack latents for transformer: [N, C, H, W] → [N, num_patches, C*4]
+            # QwenImage transformer expects packed 2x2 patches, not spatial latents
+            latents = self._pack_latents(latents)
+
+        print(f"  ✓ Cached {len(latents)} packed latents: {latents.shape}")
         return latents
 
     def reparametrize(
@@ -273,21 +384,41 @@ class TeacherInversionTrainer:
         """
         batch_size = latents_batch.shape[0]
 
-        # Add noise to latents
-        noisy_latents = self.pipeline.scheduler.add_noise(latents_batch, noise, timesteps)
+        # Add noise to latents (Flow Matching: scale_noise instead of add_noise)
+        noisy_latents = self.pipeline.scheduler.scale_noise(latents_batch, timesteps, noise)
 
         # Expand embeddings to batch size
         E_expanded = E.expand(batch_size, -1, -1)
         E_mask_expanded = E_mask.expand(batch_size, -1)
 
+        # Clone to ensure fresh tensors without inference mode flag
+        # expand() creates views which may carry forward inference flags from operations
+        E_expanded = E_expanded.clone()
+        E_mask_expanded = E_mask_expanded.clone()
+
+        # Compute transformer metadata (required for RoPE position embeddings)
+        # txt_seq_lens: use full padded sequence length for consistent RoPE frequencies in CFG
+        txt_seq_lens = [E_expanded.shape[1]] * batch_size
+
+        # img_shapes: (frame, height_latent, width_latent) per batch item
+        # Formula: original_size → VAE (÷8) → pack (÷2)
+        # Example: 768×512 → 96×64 → 48×32 latent patches
+        height_latent = self.image_height // 8 // 2  # VAE scale factor = 8, packing = 2
+        width_latent = self.image_width // 8 // 2
+        img_shapes = [[(1, height_latent, width_latent)]] * batch_size
+
         # Transformer forward (conditional)
-        model_pred_cond = self.pipeline.transformer(
-            noisy_latents,
-            timesteps,
-            encoder_hidden_states=E_expanded,
-            encoder_attention_mask=E_mask_expanded,
-            return_dict=False,
-        )[0]
+        # Use enable_grad() to override any inference mode contexts from diffusers
+        with torch.enable_grad():
+            model_pred_cond = self.pipeline.transformer(
+                hidden_states=noisy_latents,
+                timestep=timesteps,
+                encoder_hidden_states=E_expanded,
+                encoder_hidden_states_mask=E_mask_expanded,
+                img_shapes=img_shapes,
+                txt_seq_lens=txt_seq_lens,
+                return_dict=False,
+            )[0]
 
         # Optional CFG
         if self.cfg_scale > 1.0:
@@ -295,13 +426,24 @@ class TeacherInversionTrainer:
             E_neg_expanded = self.E_neg.expand(batch_size, -1, -1)
             E_neg_mask_expanded = self.E_neg_mask.expand(batch_size, -1)
 
-            model_pred_uncond = self.pipeline.transformer(
-                noisy_latents,
-                timesteps,
-                encoder_hidden_states=E_neg_expanded,
-                encoder_attention_mask=E_neg_mask_expanded,
-                return_dict=False,
-            )[0]
+            # Clone for CFG to avoid inference mode issues
+            E_neg_expanded = E_neg_expanded.clone()
+            E_neg_mask_expanded = E_neg_mask_expanded.clone()
+
+            # Compute txt_seq_lens for negative prompt (use full padded length for CFG consistency)
+            txt_seq_lens_neg = [E_neg_expanded.shape[1]] * batch_size
+
+            # Use enable_grad() for unconditional pass as well
+            with torch.enable_grad():
+                model_pred_uncond = self.pipeline.transformer(
+                    hidden_states=noisy_latents,
+                    timestep=timesteps,
+                    encoder_hidden_states=E_neg_expanded,
+                    encoder_hidden_states_mask=E_neg_mask_expanded,
+                    img_shapes=img_shapes,  # Same as conditional (same latent shape)
+                    txt_seq_lens=txt_seq_lens_neg,
+                    return_dict=False,
+                )[0]
 
             # CFG combination
             model_pred = model_pred_uncond + self.cfg_scale * (model_pred_cond - model_pred_uncond)
@@ -309,7 +451,7 @@ class TeacherInversionTrainer:
             model_pred = model_pred_cond
 
         # Determine target based on scheduler's prediction type
-        if self.pipeline.scheduler.config.prediction_type == "v_prediction":
+        if getattr(self.pipeline.scheduler.config, "prediction_type", "epsilon") == "v_prediction":
             target = self.pipeline.scheduler.get_velocity(latents_batch, noise, timesteps)
         else:  # epsilon
             target = noise
@@ -341,7 +483,7 @@ class TeacherInversionTrainer:
             - Off-slot: forces residual to zero outside slot
         """
         if loss_weights is None:
-            loss_weights = {"mse": 1.0, "rms": 0.02, "offslot": 0.05}
+            loss_weights = {"mse": 1.0, "rms": 0.5, "offslot": 1.0}
 
         # MSE loss (main)
         loss_mse = F.mse_loss(pred, target, reduction="mean")
@@ -383,9 +525,9 @@ class TeacherInversionTrainer:
         self,
         image_paths: List[Path],
         steps: int = 600,
-        lr: float = 5e-3,
+        lr: float = 1e-4,
         batch_size: int = 2,
-        grad_clip: float = 1.0,
+        grad_clip: float = 1.5,
         loss_weights: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         """
@@ -415,6 +557,17 @@ class TeacherInversionTrainer:
 
         # Optimizer
         optimizer = torch.optim.AdamW([P, log_scale], lr=lr)
+
+        # Learning rate scheduler with warmup
+        warmup_steps = int(steps * 0.15)  # 15% warmup (90 steps for 600 total)
+
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return (step + 1) / warmup_steps  # Linear warmup from 0 to 1
+            return 1.0  # Constant after warmup
+
+        from torch.optim.lr_scheduler import LambdaLR
+        scheduler = LambdaLR(optimizer, lr_lambda)
 
         # Training loop
         print(f"Training for {steps} steps...")
@@ -469,6 +622,7 @@ class TeacherInversionTrainer:
 
             # Optimizer step
             optimizer.step()
+            scheduler.step()  # Update learning rate
 
             # Check for NaN/Inf
             if torch.isnan(loss) or torch.isinf(loss):

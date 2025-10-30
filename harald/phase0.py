@@ -2,11 +2,11 @@
 
 import sys
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import torch
 
-from .core.slot_tokenizer import SlotConfig, determine_slot_config
+from .core.slot_tokenizer import SlotConfig, determine_slot_config_in_context
 
 
 def check_cuda_availability() -> Dict[str, Any]:
@@ -192,43 +192,49 @@ def scan_dataset(base_paths: List[str]) -> List[Path]:
 
 def initialize_slot_config(
     tokenizer,
-    slot_string: str = "~ID~",
-    target_length: int = 4,
+    slot_string: str,
+    base_prompt: str,
+    target_length: Optional[int] = None,
 ) -> SlotConfig:
     """
-    Initialize slot configuration by finding a slot string that tokenizes to target_length.
+    Initialize slot configuration by analyzing tokenization in actual prompt context.
+
+    This determines the exact token sequence for the slot string as it appears in
+    the base_prompt, solving the boundary-token problem where tokenizers produce
+    different IDs based on context.
 
     Args:
         tokenizer: HuggingFace tokenizer from Qwen-Image pipeline
-        slot_string: Preferred slot string (default: "~ID~")
-        target_length: Target token length (default: 4)
+        slot_string: The slot placeholder string (e.g., "~ID~" or "<ID_token>")
+        base_prompt: The actual prompt template containing the slot
+        target_length: Optional expected token length for validation (default: None)
 
     Returns:
         SlotConfig with slot_string, T_slot, L
 
     Raises:
-        SystemExit: If no valid slot string found with target_length
+        SystemExit: If slot_string not found in base_prompt or other validation fails
 
     Notes:
-        - First tries the provided slot_string
-        - If that doesn't match target_length, tries alternatives
+        - Extracts token sequence by comparing tokenization with/without slot
+        - Validates target_length if specified (fails if mismatch)
         - Logs slot configuration to stdout
     """
     print("=" * 60)
     print("Slot Configuration Initialization")
     print("=" * 60)
-    print(f"Target slot length:  {target_length} tokens")
-    print(f"Preferred string:    '{slot_string}'")
+    print(f"Slot string:         '{slot_string}'")
+    print(f"Base prompt:         '{base_prompt}'")
+    if target_length is not None:
+        print(f"Target slot length:  {target_length} tokens")
     print()
 
-    # Try the preferred slot string first
-    candidates = [slot_string, "~identity~", "~ID_token~", "~SLOT~", "~PERSON~"]
-
     try:
-        slot_config = determine_slot_config(
+        slot_config = determine_slot_config_in_context(
             tokenizer=tokenizer,
+            slot_string=slot_string,
+            base_prompt=base_prompt,
             target_length=target_length,
-            candidate_strings=candidates,
         )
 
         print(f"✓ Slot configuration determined:")
@@ -242,28 +248,15 @@ def initialize_slot_config(
         print("=" * 60)
         print()
 
-        # Warn if slot_string differs from preferred
-        if slot_config.slot_string != slot_string:
-            print()
-            print("!" * 60)
-            print("WARNING: Slot string was AUTO-SELECTED")
-            print("!" * 60)
-            print(f"  Requested:  '{slot_string}'")
-            print(f"  Selected:   '{slot_config.slot_string}'")
-            print()
-            print("IMPORTANT: Update your base_prompt to use the SELECTED slot string!")
-            print(f"  Example: 'a portrait photo of {slot_config.slot_string}, studio lighting'")
-            print("!" * 60)
-            print()
-
         return slot_config
 
     except ValueError as e:
         print(
-            f"ERROR: Could not find slot string with length {target_length}.\n"
-            f"  Tried candidates: {candidates}\n"
-            f"  Tokenizer: {tokenizer.__class__.__name__}\n"
-            f"  Error: {e}",
+            f"ERROR: Slot configuration failed.\n"
+            f"  Slot string:  '{slot_string}'\n"
+            f"  Base prompt:  '{base_prompt}'\n"
+            f"  Tokenizer:    {tokenizer.__class__.__name__}\n"
+            f"  Error:        {e}",
             file=sys.stderr,
         )
         sys.exit(1)
