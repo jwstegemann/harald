@@ -18,7 +18,7 @@ def run_phase2_for_identities(
     device,
     dtype,
     steps: int = 600,
-    lr: float = 1e-4,
+    lr: float = 3e-5,
     cfg_scale: float = 1.0,
     batch_size: int = 2,
     negative_prompt: str = " ",

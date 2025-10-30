@@ -281,7 +281,7 @@ def injection_poc(
 
 
 @app.function(
-    gpu="H100",
+    gpu="H200",
     timeout=86400,  # 24 hours
     memory=32768,  # 32GB RAM
     volumes=VOLUMES,
@@ -293,7 +293,7 @@ def run_phase0_to_phase2(
     slot_string: str = "~ID~",
     target_slot_length: int = 4,
     steps: int = 600,
-    lr: float = 1e-4,
+    lr: float = 3e-5,
     cfg_scale: float = 1.0,
     batch_size: int = 2,
     prefer_bf16: bool = True,

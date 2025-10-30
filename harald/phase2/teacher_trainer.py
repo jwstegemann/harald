@@ -324,7 +324,7 @@ class TeacherInversionTrainer:
         eps: float = 1e-8,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Re-parametrize raw residual P to stabilized residual R.
+        Re-parametrize raw residual P to stabilized residual R with hard slot masking.
 
         Args:
             P: Raw learnable residual [1, S, H]
@@ -334,21 +334,30 @@ class TeacherInversionTrainer:
         Returns:
             Tuple of (E, R):
                 - E: Modified embeddings [1, S, H] = E_base + R
-                - R: Stabilized residual [1, S, H] = scale * RMS_norm(P)
+                - R: Slot-pure residual [1, S, H] with off-slot exactly zero
 
         Notes:
-            - RMS normalization prevents explosion/collapse in fp16/bf16
+            - Hard slot mask applied BEFORE normalization (gradients never flow to off-slot)
+            - RMS normalization on slot-only part prevents explosion/collapse in fp16/bf16
             - Scale is clamped to [0.01, 1.5] for stability
         """
-        # RMS normalization
-        rms = compute_rms(P, dim=None, eps=eps)
-        P_hat = P / (rms + eps)
+        # 1) Hard slot mask - zero out off-slot positions
+        slot_mask = torch.zeros_like(P)
+        slot_mask[:, self.s : self.s + self.L, :] = 1.0
 
-        # Scale with clamp
+        # 2) Only keep slot parameters (off-slot becomes zero, no gradients flow there)
+        P_slot = P * slot_mask
+
+        # 3) RMS normalization on slot part only
+        rms = compute_rms(P_slot, dim=None, eps=eps)
+        P_hat = P_slot / (rms + eps)
+
+        # 4) Apply scale
         scale = torch.exp(log_scale).clamp(0.01, 1.5)
-
-        # Stabilized residual
         R = scale * P_hat
+
+        # 5) Safety: ensure off-slot stays exactly zero
+        R = R * slot_mask
 
         # Modified embeddings
         E = self.E_base + R
@@ -450,11 +459,9 @@ class TeacherInversionTrainer:
         else:
             model_pred = model_pred_cond
 
-        # Determine target based on scheduler's prediction type
-        if getattr(self.pipeline.scheduler.config, "prediction_type", "epsilon") == "v_prediction":
-            target = self.pipeline.scheduler.get_velocity(latents_batch, noise, timesteps)
-        else:  # epsilon
-            target = noise
+        # Flow Matching target: velocity = noise - clean
+        # (NOT epsilon like DDPM - Flow Matching always predicts velocity field)
+        target = noise - latents_batch
 
         return model_pred, target
 
@@ -504,8 +511,10 @@ class TeacherInversionTrainer:
         if R_off_slot_before.numel() > 0 or R_off_slot_after.numel() > 0:
             R_off_slot = torch.cat([R_off_slot_before, R_off_slot_after], dim=0)
             loss_offslot = torch.mean(R_off_slot**2)
+            rms_off = compute_rms(R_off_slot)
         else:
             loss_offslot = torch.tensor(0.0, device=self.device)
+            rms_off = torch.tensor(0.0, device=self.device)
 
         # Total weighted loss
         total_loss = (
@@ -519,14 +528,17 @@ class TeacherInversionTrainer:
             "mse": loss_mse,
             "rms": loss_rms,
             "offslot": loss_offslot,
+            "slot_rms": rms_slot,
+            "off_rms": rms_off,
         }
 
     def train_identity(
         self,
         image_paths: List[Path],
         steps: int = 600,
-        lr: float = 1e-4,
+        lr: float = 3e-5,
         batch_size: int = 2,
+        grad_accum_steps: int = 4,
         grad_clip: float = 1.5,
         loss_weights: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
@@ -578,57 +590,100 @@ class TeacherInversionTrainer:
 
         loss_history = []
         best_loss = float("inf")
+        metrics_log = []  # Detailed metrics every 10 steps
 
         pbar = tqdm(range(steps), desc="Training")
 
         for step in pbar:
-            # Sample batch
-            idx = torch.randperm(num_images)[:batch_size]
-            latents_batch = latents[idx]
-
-            # Sample timesteps (uniform)
-            timesteps = torch.randint(
-                0,
-                self.pipeline.scheduler.config.num_train_timesteps,
-                (batch_size,),
-                device=self.device,
-            ).long()
-
-            # Sample noise
-            noise = torch.randn_like(latents_batch)
-
-            # Re-parametrize
-            E, R = self.reparametrize(P, log_scale)
-
-            # Forward
-            pred, target = self.forward_step(
-                E,
-                self.E_base_mask,
-                latents_batch,
-                timesteps,
-                noise,
-            )
-
-            # Compute loss
-            losses = self.compute_loss(pred, target, R, loss_weights)
-            loss = losses["total"]
-
-            # Backward
+            # Zero gradients once per accumulation
             optimizer.zero_grad()
-            loss.backward()
+            accumulated_loss = 0.0
+            accumulated_losses = {"mse": 0.0, "rms": 0.0, "offslot": 0.0, "slot_rms": 0.0, "off_rms": 0.0}
 
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_([P, log_scale], grad_clip)
+            # Accumulate gradients over multiple micro-batches
+            for k in range(grad_accum_steps):
+                # Sample micro-batch
+                idx = torch.randperm(num_images)[:batch_size]
+                latents_batch = latents[idx]
 
-            # Optimizer step
+                # Sample timesteps (uniform)
+                timesteps = torch.randint(
+                    0,
+                    self.pipeline.scheduler.config.num_train_timesteps,
+                    (batch_size,),
+                    device=self.device,
+                ).long()
+
+                # Sample noise
+                noise = torch.randn_like(latents_batch)
+
+                # Re-parametrize
+                E, R = self.reparametrize(P, log_scale)
+
+                # Forward
+                pred, target = self.forward_step(
+                    E,
+                    self.E_base_mask,
+                    latents_batch,
+                    timesteps,
+                    noise,
+                )
+
+                # Compute loss
+                losses = self.compute_loss(pred, target, R, loss_weights)
+                loss = losses["total"]
+
+                # Scale loss by accumulation steps and backward
+                scaled_loss = loss / grad_accum_steps
+                scaled_loss.backward()
+
+                # Accumulate losses for logging
+                accumulated_loss += loss.item()
+                for key in accumulated_losses:
+                    accumulated_losses[key] += losses[key].item()
+
+            # Average accumulated losses
+            avg_loss = accumulated_loss / grad_accum_steps
+            for key in accumulated_losses:
+                accumulated_losses[key] /= grad_accum_steps
+
+            # Compute gradient norm BEFORE clipping (after accumulation)
+            grad_norm_before = torch.nn.utils.clip_grad_norm_([P, log_scale], float('inf'))
+
+            # Gradient clipping (returns clipped norm)
+            grad_norm_after = torch.nn.utils.clip_grad_norm_([P, log_scale], grad_clip)
+            was_clipped = grad_norm_before > grad_clip
+
+            # Single optimizer step per accumulation
             optimizer.step()
             scheduler.step()  # Update learning rate
 
-            # Check for NaN/Inf
-            if torch.isnan(loss) or torch.isinf(loss):
+            # Log detailed metrics every 10 steps
+            if step % 10 == 0:
+                current_lr = scheduler.get_last_lr()[0]
+                current_scale = torch.exp(log_scale).clamp(0.01, 1.5).item()
+
+                metric_entry = {
+                    "step": step,
+                    "loss_total": avg_loss,
+                    "loss_mse": accumulated_losses["mse"],
+                    "loss_rms": accumulated_losses["rms"],
+                    "loss_offslot": accumulated_losses["offslot"],
+                    "slot_rms": accumulated_losses["slot_rms"],
+                    "off_rms": accumulated_losses["off_rms"],
+                    "scale": current_scale,
+                    "lr": current_lr,
+                    "grad_norm_before": grad_norm_before.item(),
+                    "grad_norm_after": grad_norm_after.item(),
+                    "was_clipped": bool(was_clipped),
+                }
+                metrics_log.append(metric_entry)
+
+            # Check for NaN/Inf (use averaged loss)
+            if torch.isnan(torch.tensor(avg_loss)) or torch.isinf(torch.tensor(avg_loss)):
                 print(
                     f"\nERROR: NaN or Inf detected at step {step}.\n"
-                    f"  Loss: {loss.item()}\n"
+                    f"  Loss: {avg_loss:.4f}\n"
                     f"  Scale: {torch.exp(log_scale).item()}\n"
                     "  Try lowering LR or CFG scale.",
                     file=sys.stderr,
@@ -636,23 +691,18 @@ class TeacherInversionTrainer:
                 sys.exit(1)
 
             # Track metrics
-            loss_val = loss.item()
-            loss_history.append(loss_val)
+            loss_history.append(avg_loss)
 
-            if loss_val < best_loss:
-                best_loss = loss_val
+            if avg_loss < best_loss:
+                best_loss = avg_loss
 
-            # Compute RMS metrics
-            with torch.no_grad():
-                rms_metrics = compute_slot_off_slot_rms(R, self.s, self.L)
-
-            # Update progress bar
+            # Update progress bar (use accumulated RMS metrics)
             pbar.set_postfix(
                 {
-                    "loss": f"{loss_val:.4f}",
+                    "loss": f"{avg_loss:.4f}",
                     "scale": f"{torch.exp(log_scale).item():.3f}",
-                    "slot_rms": f"{rms_metrics['slot_rms']:.3f}",
-                    "off_rms": f"{rms_metrics['off_slot_rms']:.6f}",
+                    "slot_rms": f"{accumulated_losses['slot_rms']:.3f}",
+                    "off_rms": f"{accumulated_losses['off_rms']:.6f}",
                 }
             )
 
@@ -669,7 +719,7 @@ class TeacherInversionTrainer:
                 if all(recent_losses[i] > recent_losses[i - 1] for i in range(1, len(recent_losses))):
                     print(
                         f"\nERROR: Loss diverging (increasing for 50 consecutive steps).\n"
-                        f"  Current loss: {loss_val:.4f}\n"
+                        f"  Current loss: {avg_loss:.4f}\n"
                         f"  Best loss: {best_loss:.4f}\n"
                         "  Try halving LR or reducing CFG.",
                         file=sys.stderr,
@@ -686,7 +736,7 @@ class TeacherInversionTrainer:
 
         metrics = {
             "steps_completed": step + 1,
-            "final_loss": loss_val,
+            "final_loss": avg_loss,
             "best_loss": best_loss,
             "final_scale": torch.exp(log_scale).item(),
             **final_rms,
@@ -699,6 +749,7 @@ class TeacherInversionTrainer:
             "E_final": E_final.detach(),
             "R_final": R_final.detach(),
             "metrics": metrics,
+            "metrics_log": metrics_log,  # Detailed metrics every 10 steps
         }
 
     def post_process_and_save(
@@ -781,6 +832,15 @@ class TeacherInversionTrainer:
         print(f"  Shape: {E_teacher_cpu.shape}")
         print(f"  dtype: {E_teacher_cpu.dtype}")
         print()
+
+        # Save detailed training metrics log
+        if "metrics_log" in training_result and len(training_result["metrics_log"]) > 0:
+            metrics_log_path = output_path.parent / "training_metrics.json"
+            with open(metrics_log_path, "w") as f:
+                json.dump(training_result["metrics_log"], f, indent=2)
+            print(f"✓ Saved training metrics to {metrics_log_path}")
+            print(f"  Entries: {len(training_result['metrics_log'])}")
+            print()
 
         return output_path
 
