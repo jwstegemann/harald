@@ -117,6 +117,7 @@ def run_phase2_for_identities(
                 batch_size=batch_size,
                 timestep_sampling_scheme=timestep_sampling_scheme,
                 loss_weighting_scheme=loss_weighting_scheme,
+                output_dir=identity_output_dir,
             )
 
             # Post-process and save

@@ -690,6 +690,114 @@ class TeacherInversionTrainer:
             "off_rms": rms_off,
         }
 
+    def load_and_parse_prompt(self, image_paths: List[Path]) -> Optional[str]:
+        """
+        Load prompt from first photo_view image and extract person description.
+
+        Prompts follow the pattern:
+        "portrait single subject. upper-body shot of [PERSON_DESC]. (perfect..."
+
+        Returns:
+            Person-specific description or None if not found
+        """
+        import re
+
+        # Find first photo_view_*.txt file
+        image_dir = image_paths[0].parent
+        prompt_file = image_dir / "photo_view_01.txt"
+
+        if not prompt_file.exists():
+            # Fallback: Try any photo_view_*.txt
+            txt_files = sorted(image_dir.glob("photo_view_*.txt"))
+            if txt_files:
+                prompt_file = txt_files[0]
+            else:
+                return None
+
+        with open(prompt_file, 'r') as f:
+            full_prompt = f.read().strip()
+
+        # Extract person description between "shot of " and ". (perfect"
+        match = re.search(r'shot of (.+?)\s*\.\s*\(perfect', full_prompt, re.DOTALL)
+        if match:
+            person_desc = match.group(1).strip()
+            return person_desc
+
+        # Fallback: If pattern doesn't match, return None
+        print(f"  Warning: Could not parse prompt pattern from: {full_prompt[:100]}...")
+        return None
+
+    def compute_p_init_from_description(self, description: str) -> torch.Tensor:
+        """
+        Compute initial P from person description.
+
+        Args:
+            description: Person-specific part, e.g. "60yo woman, blonde hair, ..."
+
+        Returns:
+            P_init [1, S, H] - initialized parameter
+        """
+        # Encode the person description only
+        E_desc, E_desc_mask = self.pipeline.encode_text(description)
+        E_desc = E_desc.to(self.device, dtype=self.dtype)
+
+        # Get description length (actual tokens, not padding)
+        desc_len = E_desc_mask.sum().item()
+
+        if desc_len == 0:
+            # Fallback: zero init
+            return torch.zeros(1, self.S, self.H, device=self.device, dtype=self.dtype)
+
+        # Average multiple token groups for robustness
+        groups = []
+
+        # First tokens (often subject: "60yo woman")
+        if desc_len >= 2:
+            groups.append(E_desc[0, :min(4, desc_len), :].mean(dim=0, keepdim=True))
+
+        # Middle tokens (often key features)
+        if desc_len >= 6:
+            mid_start = max(0, (desc_len - 4) // 2)
+            mid_end = min(desc_len, mid_start + 4)
+            groups.append(E_desc[0, mid_start:mid_end, :].mean(dim=0, keepdim=True))
+
+        # Last tokens (often detailed features)
+        if desc_len >= 2:
+            last_start = max(0, desc_len - 4)
+            groups.append(E_desc[0, last_start:desc_len, :].mean(dim=0, keepdim=True))
+
+        # Average all groups to get representative embedding for each slot token
+        if groups:
+            E_slot_init = torch.cat(groups, dim=0).mean(dim=0)  # [H]
+            # Expand to L tokens
+            E_slot_init = E_slot_init.unsqueeze(0).expand(self.L, -1)  # [L, H]
+        else:
+            return torch.zeros(1, self.S, self.H, device=self.device, dtype=self.dtype)
+
+        # Compute residual at slot position
+        E_base_slot = self.E_base[0, self.s:self.s+self.L, :]  # [L, H]
+        R_slot = E_slot_init - E_base_slot  # [L, H]
+
+        # Invert reparametrization: R → P
+        # Forward: P_slot → normalize(RMS=1) → scale → R
+        # Backward: R → un-scale → un-normalize → P_slot
+
+        scale_init = 1.0  # Will be learned
+        P_hat_slot = R_slot / scale_init
+
+        # Scale to target RMS (0.7)
+        rms_init = compute_rms(P_hat_slot)
+        if rms_init > 1e-8:
+            P_slot = P_hat_slot * (0.7 / rms_init)
+        else:
+            P_slot = P_hat_slot
+
+        # Create full P tensor (zeros everywhere except slot)
+        P_init = torch.zeros(1, self.S, self.H, device=self.device, dtype=self.dtype)
+        P_init[0, self.s:self.s+self.L, :] = P_slot
+
+        return P_init
+
     def train_identity(
         self,
         image_paths: List[Path],
@@ -701,6 +809,7 @@ class TeacherInversionTrainer:
         loss_weights: Optional[Dict[str, float]] = None,
         timestep_sampling_scheme: str = "logit_normal",
         loss_weighting_scheme: str = "cosmap",
+        output_dir: Optional[Path] = None,
     ) -> Dict[str, Any]:
         """
         Train teacher embeddings for a single identity.
@@ -715,6 +824,7 @@ class TeacherInversionTrainer:
             loss_weights: Optional custom loss weights
             timestep_sampling_scheme: Timestep sampling ("uniform", "logit_normal", "mode") (default: "logit_normal")
             loss_weighting_scheme: Loss weighting ("none", "cosmap", "sigma_sqrt") (default: "cosmap")
+            output_dir: Output directory for intermediate QA grids (required for step 100 checkpoint)
 
         Returns:
             Dict with training metrics and final parameters
@@ -732,8 +842,21 @@ class TeacherInversionTrainer:
         num_images = len(latents)
 
         # Initialize learnable parameters
-        P = torch.zeros(1, self.S, self.H, device=self.device, dtype=self.dtype, requires_grad=True)
+        # Try to initialize P from person description in prompt
+        person_desc = self.load_and_parse_prompt(image_paths)
+        if person_desc is not None:
+            print(f"  Initializing P from prompt: '{person_desc[:60]}{'...' if len(person_desc) > 60 else ''}'")
+            P_init = self.compute_p_init_from_description(person_desc)
+            P = torch.nn.Parameter(P_init.detach().clone()).requires_grad_(True)
+        else:
+            print("  No prompt found, using zero initialization")
+            P = torch.nn.Parameter(torch.zeros(1, self.S, self.H, device=self.device, dtype=self.dtype)).requires_grad_(True)
+
         log_scale = torch.nn.Parameter(torch.tensor(0.0, device=self.device, dtype=self.dtype))
+
+        # Verify parameters are trainable
+        print(f"  P.requires_grad: {P.requires_grad}")
+        print(f"  log_scale.requires_grad: {log_scale.requires_grad}")
 
         # Optimizer
         optimizer = torch.optim.AdamW([P, log_scale], lr=lr)
@@ -816,13 +939,11 @@ class TeacherInversionTrainer:
                 for key in accumulated_losses:
                     accumulated_losses[key] += losses[key].item()
 
-            # Normalize gradients by batch_size (expand+clone causes gradient summation)
-            # Each batch item contributes a full gradient to E, so we must divide by batch_size
-            # CRITICAL: This must happen ONCE after accumulation, not inside the loop!
-            if P.grad is not None:
-                P.grad.div_(batch_size)
-            if log_scale.grad is not None:
-                log_scale.grad.div_(batch_size)
+            # NOTE: No gradient normalization needed here!
+            # The losses are computed with reduction="mean", so gradients are already averaged.
+            # The expand+clone pattern DOES sum gradients, BUT each individual gradient is
+            # already divided by batch_size (because loss is averaged), so they cancel out.
+            # Previous incorrect normalization: P.grad.div_(batch_size) made gradients too small!
 
             # Average accumulated losses
             avg_loss = accumulated_loss / grad_accum_steps
@@ -889,6 +1010,32 @@ class TeacherInversionTrainer:
                     "off_rms": f"{accumulated_losses['off_rms']:.6f}",
                 }
             )
+
+            # Generate intermediate QA grid at step 100
+            if step == 100:
+                print(f"\n  Generating intermediate QA grid (step {step})...")
+                with torch.no_grad():
+                    E_checkpoint, _ = self.reparametrize(P, log_scale)
+                    E_checkpoint = E_checkpoint.detach()
+
+                # Use output directory for intermediate QA
+                if output_dir is None:
+                    raise ValueError("output_dir must be provided for intermediate QA generation at step 100")
+                qa_dir = output_dir / f"qa_step{step}"
+                qa_dir.mkdir(exist_ok=True, parents=True)
+
+                # Generate QA grid with reduced seeds for speed
+                self.alpha_qa(
+                    E_teacher=E_checkpoint,
+                    alphas=[0.5, 1.0, 1.5, 2.0],
+                    seeds=[4, 5],  # Reduced to 2 seeds (8 images instead of 16)
+                    output_dir=qa_dir,
+                )
+
+                # Cleanup
+                del E_checkpoint
+                torch.cuda.empty_cache()
+                print(f"  ✓ Intermediate QA saved to {qa_dir / 'alpha_qa_grid.png'}\n")
 
             # Check for plateau (early stopping)
             if step > 100 and step % 100 == 0:
