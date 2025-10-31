@@ -300,6 +300,8 @@ def run_phase0_to_phase2(
     negative_prompt: str = " ",
     alpha_qa_alphas: str = "0.5,1.0,1.5,2.0",
     alpha_qa_seeds: str = "4,5,6,7",
+    timestep_sampling_scheme: str = "logit_normal",
+    loss_weighting_scheme: str = "cosmap",
 ):
     """
     Run Phase 0-2: Environment check, minimal render test, and teacher inversion.
@@ -310,13 +312,15 @@ def run_phase0_to_phase2(
         slot_string: Slot placeholder string (default: "~ID~")
         target_slot_length: Target token length for slot (default: 4)
         steps: Training steps per identity (default: 600)
-        lr: Learning rate (default: 5e-3)
-        cfg_scale: CFG scale for training (default: 4.5)
+        lr: Learning rate (default: 3e-5)
+        cfg_scale: CFG scale for training (default: 1.0)
         batch_size: Batch size for training (default: 2)
         prefer_bf16: Prefer bfloat16 over float16 (default: True)
         negative_prompt: Negative prompt (default: " " - empty)
         alpha_qa_alphas: Comma-separated alpha values for QA (default: "0.5,1.0,1.5,2.0")
-        alpha_qa_seeds: Comma-separated seeds for QA (default: "4,5,...,19")
+        alpha_qa_seeds: Comma-separated seeds for QA (default: "4,5,6,7")
+        timestep_sampling_scheme: Timestep sampling ("uniform", "logit_normal", "mode") (default: "logit_normal")
+        loss_weighting_scheme: Loss weighting ("none", "cosmap", "sigma_sqrt") (default: "cosmap")
 
     Example:
         modal run -m harald.modal_runner::run_phase0_to_phase2 --seed-dirs "/mnt/dataset/0/seed_12345,/mnt/dataset/0/seed_67890"
@@ -441,6 +445,8 @@ def run_phase0_to_phase2(
         negative_prompt=negative_prompt,
         alpha_qa_alphas=alphas_list,
         alpha_qa_seeds=seeds_list,
+        timestep_sampling_scheme=timestep_sampling_scheme,
+        loss_weighting_scheme=loss_weighting_scheme,
     )
 
     print("✓ Phase 2 complete.\n")

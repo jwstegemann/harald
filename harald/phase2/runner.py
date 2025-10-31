@@ -24,6 +24,8 @@ def run_phase2_for_identities(
     negative_prompt: str = " ",
     alpha_qa_alphas: List[float] = [0.5, 1.0, 1.5, 2.0],
     alpha_qa_seeds: List[int] = list(range(4, 8)),
+    timestep_sampling_scheme: str = "logit_normal",
+    loss_weighting_scheme: str = "cosmap",
 ) -> List[Dict[str, Any]]:
     """
     Run Phase 2 teacher inversion for multiple identities.
@@ -43,6 +45,8 @@ def run_phase2_for_identities(
         negative_prompt: Negative prompt
         alpha_qa_alphas: Alphas for QA grid
         alpha_qa_seeds: Seeds for QA grid
+        timestep_sampling_scheme: Timestep sampling ("uniform", "logit_normal", "mode")
+        loss_weighting_scheme: Loss weighting ("none", "cosmap", "sigma_sqrt")
 
     Returns:
         List of result dicts (one per identity)
@@ -52,6 +56,7 @@ def run_phase2_for_identities(
         - Saves teacher_prompt_embeds.pt per identity
         - Generates alpha-QA grid per identity
         - Collects metrics in summary JSON
+        - Uses Qwen-Image/SD3 approach for timestep sampling and loss weighting
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -110,6 +115,8 @@ def run_phase2_for_identities(
                 steps=steps,
                 lr=lr,
                 batch_size=batch_size,
+                timestep_sampling_scheme=timestep_sampling_scheme,
+                loss_weighting_scheme=loss_weighting_scheme,
             )
 
             # Post-process and save

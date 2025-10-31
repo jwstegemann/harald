@@ -20,6 +20,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
+from diffusers.training_utils import (
+    compute_density_for_timestep_sampling,
+    compute_loss_weighting_for_sd3,
+)
 
 from ..models.qwen_image import QwenImagePipeline
 from ..core.slot_tokenizer import SlotConfig
@@ -339,7 +343,7 @@ class TeacherInversionTrainer:
         Notes:
             - Hard slot mask applied BEFORE normalization (gradients never flow to off-slot)
             - RMS normalization on slot-only part prevents explosion/collapse in fp16/bf16
-            - Scale is clamped to [0.01, 1.5] for stability
+            - Scale is clamped to [0.01, 2.0] for stability
         """
         # 1) Hard slot mask - zero out off-slot positions
         slot_mask = torch.zeros_like(P)
@@ -353,7 +357,7 @@ class TeacherInversionTrainer:
         P_hat = P_slot / (rms + eps)
 
         # 4) Apply scale
-        scale = torch.exp(log_scale).clamp(0.01, 1.5)
+        scale = torch.exp(log_scale).clamp(0.01, 2.0)
         R = scale * P_hat
 
         # 5) Safety: ensure off-slot stays exactly zero
@@ -363,6 +367,137 @@ class TeacherInversionTrainer:
         E = self.E_base + R
 
         return E, R
+
+    def sample_timesteps(
+        self,
+        batch_size: int,
+        weighting_scheme: str = "logit_normal",
+        logit_mean: float = 0.0,
+        logit_std: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        Sample timesteps for Flow Matching training (direct computation).
+
+        Args:
+            batch_size: Number of timesteps to sample
+            weighting_scheme: Sampling distribution ("uniform", "logit_normal", "mode")
+            logit_mean: Mean for logit_normal distribution (default: 0.0)
+            logit_std: Std for logit_normal distribution (default: 1.0)
+
+        Returns:
+            Timestep values [batch_size] for transformer input
+
+        Notes:
+            - Samples u ∈ [0,1] and computes sigmas directly
+            - Restricts to central 85% of range (u ∈ [0.05, 0.9]) for stability
+            - Does NOT depend on scheduler.timesteps (which may be in inference mode)
+            - Returns timestep values for transformer, not sigma values
+            - Wider range than 70% to capture low-noise details for small concepts
+        """
+        # Sample u values from [0, 1] according to distribution
+        u = compute_density_for_timestep_sampling(
+            weighting_scheme=weighting_scheme,
+            batch_size=batch_size,
+            logit_mean=logit_mean,
+            logit_std=logit_std,
+            mode_scale=None,
+        )
+        u = u.to(device=self.device)
+
+        # Restrict to central 85% of timestep range (avoid extreme ends)
+        # Maps [0, 1] → [0.05, 0.9]
+        u = 0.05 + u * 0.85
+
+        # Compute sigmas directly from u (Flow Matching formula)
+        # u=0.05 → sigma=0.95 (high noise), u=0.9 → sigma=0.1 (low noise)
+        sigmas = 1.0 - u
+
+        # Apply shift correction if configured
+        shift = self.pipeline.scheduler.config.shift
+        if shift != 1.0:
+            sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
+
+        # Convert sigmas to timestep values for transformer
+        num_train_timesteps = self.pipeline.scheduler.config.num_train_timesteps
+        timesteps = sigmas * num_train_timesteps
+
+        return timesteps
+
+    def get_sigmas(
+        self,
+        timesteps: torch.Tensor,
+        n_dim: int = 4,
+    ) -> torch.Tensor:
+        """
+        Compute sigma values from timestep values (direct formula).
+
+        This is the CORRECT pattern for Flow Matching training - compute sigmas
+        directly from timestep values using the mathematical formula, NOT by
+        looking up in scheduler arrays.
+
+        Args:
+            timesteps: Timestep VALUES [batch_size] (sigma * num_train_timesteps)
+            n_dim: Number of dimensions to broadcast to (default: 4 for latents)
+
+        Returns:
+            Sigmas tensor broadcastable to latent shape
+
+        Notes:
+            - Sigmas are used for noise computation and loss weighting
+            - CRITICAL: Direct computation, independent of scheduler state
+            - Works regardless of whether set_timesteps() was called
+        """
+        # Get scheduler config
+        num_train_timesteps = self.pipeline.scheduler.config.num_train_timesteps
+
+        # Convert timestep values to sigmas using direct formula
+        # timestep = sigma * num_train_timesteps → sigma = timestep / num_train_timesteps
+        sigmas = timesteps.to(dtype=self.dtype, device=self.device) / num_train_timesteps
+
+        # Note: We don't need to invert the shift transformation here because
+        # timesteps already encode the shifted sigmas (computed in sample_timesteps)
+
+        # Broadcast to n_dim (e.g., [B] -> [B, 1, 1, 1] for 4D latents)
+        while len(sigmas.shape) < n_dim:
+            sigmas = sigmas.unsqueeze(-1)
+
+        return sigmas
+
+    def compute_loss_weights(
+        self,
+        sigmas: torch.Tensor,
+        weighting_scheme: str = "cosmap",
+    ) -> torch.Tensor:
+        """
+        Compute per-timestep loss weights using SD3/Qwen-Image approach.
+
+        Args:
+            sigmas: Sigma values [batch_size, 1, 1, 1]
+            weighting_scheme: Weighting scheme ("none", "cosmap", "sigma_sqrt")
+
+        Returns:
+            Loss weights tensor (same shape as sigmas)
+
+        Notes:
+            - "none": Uniform weighting (all timesteps equal)
+            - "cosmap": Cosine mapping from SD3 paper (recommended)
+            - "sigma_sqrt": Inverse variance weighting
+        """
+        import math
+
+        if weighting_scheme == "sigma_sqrt":
+            # Inverse variance weighting (emphasizes low-noise timesteps)
+            # Add epsilon for numerical stability (prevents division by zero)
+            weighting = (sigmas**2 + 1e-5)**-1.0
+        elif weighting_scheme == "cosmap":
+            # Cosine-based weighting from SD3 paper
+            bot = 1 - 2 * sigmas + 2 * sigmas**2
+            weighting = 2 / (math.pi * bot)
+        else:
+            # "none" - uniform weighting
+            weighting = torch.ones_like(sigmas)
+
+        return weighting
 
     def forward_step(
         self,
@@ -379,22 +514,28 @@ class TeacherInversionTrainer:
             E: Modified prompt embeddings [1, S, H]
             E_mask: Prompt embeddings mask [1, S]
             latents_batch: Batch of latents [batch, C, H_lat, W_lat]
-            timesteps: Timesteps [batch]
+            timesteps: Timestep values [batch] from scheduler (for transformer)
             noise: Noise tensor (same shape as latents_batch)
 
         Returns:
             Tuple of (pred, target):
-                - pred: UNet prediction (noise or v)
-                - target: Ground truth (noise or v)
+                - pred: Transformer prediction (velocity field for Flow Matching)
+                - target: Ground truth velocity (noise - clean)
 
         Notes:
-            - Handles scheduler's prediction_type (epsilon vs. v_prediction)
+            - Uses manual noisy latent computation (Flow Matching training pattern)
+            - Does NOT use scheduler.scale_noise() (avoids CUDA errors)
             - Implements CFG if cfg_scale > 1.0
+            - Computes sigmas internally using official lookup pattern
         """
         batch_size = latents_batch.shape[0]
 
-        # Add noise to latents (Flow Matching: scale_noise instead of add_noise)
-        noisy_latents = self.pipeline.scheduler.scale_noise(latents_batch, timesteps, noise)
+        # Compute sigmas from timesteps using official lookup pattern
+        sigmas = self.get_sigmas(timesteps, n_dim=latents_batch.ndim)
+
+        # Compute noisy latents manually (Flow Matching formula)
+        # This is the official training pattern - do NOT use scheduler.scale_noise()
+        noisy_latents = (1.0 - sigmas) * latents_batch + sigmas * noise
 
         # Expand embeddings to batch size
         E_expanded = E.expand(batch_size, -1, -1)
@@ -470,6 +611,8 @@ class TeacherInversionTrainer:
         pred: torch.Tensor,
         target: torch.Tensor,
         R: torch.Tensor,
+        sigmas: Optional[torch.Tensor] = None,
+        weighting_scheme: str = "cosmap",
         loss_weights: Dict[str, float] = None,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -479,28 +622,43 @@ class TeacherInversionTrainer:
             pred: Model prediction
             target: Ground truth
             R: Current residual [1, S, H]
-            loss_weights: Dict with keys "mse", "rms", "offslot" (defaults provided)
+            sigmas: Sigma values for timestep weighting [batch, 1, 1, 1]
+            weighting_scheme: Weighting scheme for MSE loss ("none", "cosmap", "sigma_sqrt")
+            loss_weights: Dict with keys "mse", "rms", "offslot" (default: {1.0, 0.1, 1.0})
 
         Returns:
             Dict with all loss components and total loss
 
         Notes:
-            - MSE: main noise prediction loss
-            - RMS: keeps slot RMS in reasonable range
+            - MSE: main noise prediction loss (weighted by timestep/sigma)
+            - RMS: light regularization (weight=0.1) - prevents scale extremes
             - Off-slot: forces residual to zero outside slot
         """
         if loss_weights is None:
-            loss_weights = {"mse": 1.0, "rms": 0.5, "offslot": 1.0}
+            loss_weights = {"mse": 1.0, "rms": 0.1, "offslot": 1.0}
 
-        # MSE loss (main)
-        loss_mse = F.mse_loss(pred, target, reduction="mean")
+        # MSE loss (main) with optional timestep weighting
+        if sigmas is not None and weighting_scheme != "none":
+            # Qwen-Image / SD3 approach: weight by sigma to prevent late timesteps from dominating
+            loss_weighting = self.compute_loss_weights(sigmas, weighting_scheme)
+
+            # Compute per-sample weighted MSE
+            mse_per_sample = (
+                (loss_weighting.float() * (pred.float() - target.float()) ** 2)
+                .reshape(pred.shape[0], -1)
+                .mean(dim=1)
+            )
+            loss_mse = mse_per_sample.mean()
+        else:
+            # Uniform weighting (original behavior)
+            loss_mse = F.mse_loss(pred, target, reduction="mean")
 
         # RMS regularization (slot only)
         R_slot = R[0, self.s : self.s + self.L, :]  # [L, H]
         rms_slot = compute_rms(R_slot)
 
-        # Target RMS around 0.8-1.2 (adjust based on observed values)
-        target_rms = 1.0
+        # Target RMS 0.7 (lower than base to preserve prompt semantics)
+        target_rms = 0.7
         loss_rms = F.l1_loss(rms_slot, torch.tensor(target_rms, device=self.device))
 
         # Off-slot sparsity (force to zero)
@@ -536,11 +694,13 @@ class TeacherInversionTrainer:
         self,
         image_paths: List[Path],
         steps: int = 600,
-        lr: float = 3e-5,
+        lr: float = 1e-4,
         batch_size: int = 2,
         grad_accum_steps: int = 4,
-        grad_clip: float = 1.5,
+        grad_clip: float = 5.0,
         loss_weights: Optional[Dict[str, float]] = None,
+        timestep_sampling_scheme: str = "logit_normal",
+        loss_weighting_scheme: str = "cosmap",
     ) -> Dict[str, Any]:
         """
         Train teacher embeddings for a single identity.
@@ -548,16 +708,24 @@ class TeacherInversionTrainer:
         Args:
             image_paths: List of 2-5 image paths for this identity
             steps: Number of optimization steps (default: 600)
-            lr: Learning rate (default: 5e-3)
+            lr: Learning rate (default: 1e-4)
             batch_size: Batch size (default: 2)
-            grad_clip: Gradient clipping threshold (default: 1.0)
+            grad_accum_steps: Gradient accumulation steps (default: 4)
+            grad_clip: Gradient clipping threshold (default: 5.0)
             loss_weights: Optional custom loss weights
+            timestep_sampling_scheme: Timestep sampling ("uniform", "logit_normal", "mode") (default: "logit_normal")
+            loss_weighting_scheme: Loss weighting ("none", "cosmap", "sigma_sqrt") (default: "cosmap")
 
         Returns:
             Dict with training metrics and final parameters
 
         Raises:
             SystemExit: On NaN/Inf or divergence
+
+        Notes:
+            - Uses Qwen-Image/SD3 approach for timestep sampling and loss weighting
+            - "logit_normal" + "cosmap" is the recommended combination (official Qwen training)
+            - Loss weighting prevents late (high-noise) timesteps from dominating gradients
         """
         # Prepare latents (cached)
         latents = self.prepare_images(image_paths)
@@ -565,7 +733,7 @@ class TeacherInversionTrainer:
 
         # Initialize learnable parameters
         P = torch.zeros(1, self.S, self.H, device=self.device, dtype=self.dtype, requires_grad=True)
-        log_scale = torch.nn.Parameter(torch.tensor(0.0, device=self.device, dtype=torch.float32))
+        log_scale = torch.nn.Parameter(torch.tensor(0.0, device=self.device, dtype=self.dtype))
 
         # Optimizer
         optimizer = torch.optim.AdamW([P, log_scale], lr=lr)
@@ -585,7 +753,10 @@ class TeacherInversionTrainer:
         print(f"Training for {steps} steps...")
         print(f"  Images: {num_images}")
         print(f"  Batch size: {batch_size}")
+        print(f"  Gradient accumulation: {grad_accum_steps}")
         print(f"  Learning rate: {lr}")
+        print(f"  Timestep sampling: {timestep_sampling_scheme}")
+        print(f"  Loss weighting: {loss_weighting_scheme}")
         print()
 
         loss_history = []
@@ -606,13 +777,14 @@ class TeacherInversionTrainer:
                 idx = torch.randperm(num_images)[:batch_size]
                 latents_batch = latents[idx]
 
-                # Sample timesteps (uniform)
-                timesteps = torch.randint(
-                    0,
-                    self.pipeline.scheduler.config.num_train_timesteps,
-                    (batch_size,),
-                    device=self.device,
-                ).long()
+                # Sample timesteps using Qwen-Image/SD3 approach (official pattern)
+                timesteps = self.sample_timesteps(
+                    batch_size=batch_size,
+                    weighting_scheme=timestep_sampling_scheme,
+                )
+
+                # Compute sigmas for loss weighting (official lookup pattern)
+                sigmas = self.get_sigmas(timesteps, n_dim=latents_batch.ndim)
 
                 # Sample noise
                 noise = torch.randn_like(latents_batch)
@@ -620,7 +792,7 @@ class TeacherInversionTrainer:
                 # Re-parametrize
                 E, R = self.reparametrize(P, log_scale)
 
-                # Forward
+                # Forward (computes sigmas internally with official lookup pattern)
                 pred, target = self.forward_step(
                     E,
                     self.E_base_mask,
@@ -629,8 +801,10 @@ class TeacherInversionTrainer:
                     noise,
                 )
 
-                # Compute loss
-                losses = self.compute_loss(pred, target, R, loss_weights)
+                # Compute loss with timestep weighting
+                losses = self.compute_loss(
+                    pred, target, R, sigmas, loss_weighting_scheme, loss_weights
+                )
                 loss = losses["total"]
 
                 # Scale loss by accumulation steps and backward
@@ -642,17 +816,28 @@ class TeacherInversionTrainer:
                 for key in accumulated_losses:
                     accumulated_losses[key] += losses[key].item()
 
+            # Normalize gradients by batch_size (expand+clone causes gradient summation)
+            # Each batch item contributes a full gradient to E, so we must divide by batch_size
+            # CRITICAL: This must happen ONCE after accumulation, not inside the loop!
+            if P.grad is not None:
+                P.grad.div_(batch_size)
+            if log_scale.grad is not None:
+                log_scale.grad.div_(batch_size)
+
             # Average accumulated losses
             avg_loss = accumulated_loss / grad_accum_steps
             for key in accumulated_losses:
                 accumulated_losses[key] /= grad_accum_steps
 
-            # Compute gradient norm BEFORE clipping (after accumulation)
-            grad_norm_before = torch.nn.utils.clip_grad_norm_([P, log_scale], float('inf'))
+            # Compute gradient norm BEFORE clipping (honest measurement)
+            total_norm = torch.norm(torch.stack([
+                torch.norm(P.grad.detach(), 2),
+                torch.norm(log_scale.grad.detach(), 2),
+            ]), 2).item()
 
-            # Gradient clipping (returns clipped norm)
-            grad_norm_after = torch.nn.utils.clip_grad_norm_([P, log_scale], grad_clip)
-            was_clipped = grad_norm_before > grad_clip
+            # Gradient clipping (only clip once)
+            torch.nn.utils.clip_grad_norm_([P, log_scale], grad_clip)
+            was_clipped = total_norm > grad_clip
 
             # Single optimizer step per accumulation
             optimizer.step()
@@ -661,7 +846,7 @@ class TeacherInversionTrainer:
             # Log detailed metrics every 10 steps
             if step % 10 == 0:
                 current_lr = scheduler.get_last_lr()[0]
-                current_scale = torch.exp(log_scale).clamp(0.01, 1.5).item()
+                current_scale = torch.exp(log_scale).clamp(0.01, 2.0).item()
 
                 metric_entry = {
                     "step": step,
@@ -673,8 +858,7 @@ class TeacherInversionTrainer:
                     "off_rms": accumulated_losses["off_rms"],
                     "scale": current_scale,
                     "lr": current_lr,
-                    "grad_norm_before": grad_norm_before.item(),
-                    "grad_norm_after": grad_norm_after.item(),
+                    "grad_norm": total_norm,
                     "was_clipped": bool(was_clipped),
                 }
                 metrics_log.append(metric_entry)
@@ -851,7 +1035,7 @@ class TeacherInversionTrainer:
         seeds: List[int] = list(range(4, 20)),
         output_dir: Path = None,
         num_inference_steps: int = 30,
-        guidance_scale: float = 4.0,
+        true_cfg_scale: float = 2.5,
         height: int = 1024,
         width: int = 1024,
     ) -> Path:
@@ -864,7 +1048,7 @@ class TeacherInversionTrainer:
             seeds: List of seeds
             output_dir: Output directory
             num_inference_steps: Diffusion steps
-            guidance_scale: CFG scale
+            true_cfg_scale: Traditional CFG scale (2.5 recommended for inference)
             height: Image height
             width: Image width
 
@@ -874,6 +1058,8 @@ class TeacherInversionTrainer:
         Notes:
             - E_eval(α) = E_base + α * (E_teacher - E_base)
             - Grid rows = alphas, cols = seeds
+            - Uses traditional classifier-free guidance (true_cfg_scale)
+            - Wrapper converts to pipeline's true_cfg_scale parameter
         """
         print("Generating alpha-QA grid...")
         print(f"  Alphas: {alphas}")
@@ -904,7 +1090,7 @@ class TeacherInversionTrainer:
                     negative_prompt_embeds=neg_embeds,
                     negative_prompt_embeds_mask=neg_mask,
                     num_inference_steps=num_inference_steps,
-                    guidance_scale=guidance_scale,
+                    guidance_scale=true_cfg_scale,
                     height=height,
                     width=width,
                     seed=seed,
@@ -925,7 +1111,7 @@ class TeacherInversionTrainer:
             "base_prompt": self.base_prompt,
             "slot_string": self.slot_config.slot_string,
             "num_inference_steps": num_inference_steps,
-            "guidance_scale": guidance_scale,
+            "true_cfg_scale": true_cfg_scale,
             "height": height,
             "width": width,
         }
