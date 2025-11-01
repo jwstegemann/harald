@@ -11,6 +11,7 @@ Key features:
 """
 
 import json
+import math
 import sys
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
@@ -122,19 +123,34 @@ class TeacherInversionTrainer:
             if S_neg < S_base:
                 # Pad with zeros to match length
                 padding_length = S_base - S_neg
-                padding = torch.zeros(B, padding_length, H, device=self.E_neg.device, dtype=self.E_neg.dtype)
+                padding = torch.zeros(
+                    B,
+                    padding_length,
+                    H,
+                    device=self.E_neg.device,
+                    dtype=self.E_neg.dtype,
+                )
                 self.E_neg = torch.cat([self.E_neg, padding], dim=1)
 
                 # Pad mask with zeros (indicating padded positions)
-                mask_padding = torch.zeros(B, padding_length, device=self.E_neg_mask.device, dtype=self.E_neg_mask.dtype)
+                mask_padding = torch.zeros(
+                    B,
+                    padding_length,
+                    device=self.E_neg_mask.device,
+                    dtype=self.E_neg_mask.dtype,
+                )
                 self.E_neg_mask = torch.cat([self.E_neg_mask, mask_padding], dim=1)
 
-                print(f"  ℹ Padded negative prompt embeddings: {S_neg} → {S_base} tokens")
+                print(
+                    f"  ℹ Padded negative prompt embeddings: {S_neg} → {S_base} tokens"
+                )
             else:
                 # Truncate if longer (unlikely but handle it)
                 self.E_neg = self.E_neg[:, :S_base, :]
                 self.E_neg_mask = self.E_neg_mask[:, :S_base]
-                print(f"  ℹ Truncated negative prompt embeddings: {S_neg} → {S_base} tokens")
+                print(
+                    f"  ℹ Truncated negative prompt embeddings: {S_neg} → {S_base} tokens"
+                )
 
         # Final validation
         if self.E_neg.shape != self.E_base.shape:
@@ -157,13 +173,13 @@ class TeacherInversionTrainer:
         print(f"✓ Teacher trainer initialized")
         print(f"  Base prompt:   '{base_prompt}'")
         print(f"  Slot position: s={self.s}, L={self.L}")
-        print(f"  Embeddings:    shape={self.E_base.shape}, device={self.device}, dtype={self.dtype}")
+        print(
+            f"  Embeddings:    shape={self.E_base.shape}, device={self.device}, dtype={self.dtype}"
+        )
         print(f"  CFG scale:     {cfg_scale}")
         print()
 
-    def _pack_latents(
-        self, latents: torch.Tensor
-    ) -> torch.Tensor:
+    def _pack_latents(self, latents: torch.Tensor) -> torch.Tensor:
         """
         Pack latents from [B, C, H, W] to [B, num_patches, C*4] for transformer.
 
@@ -291,7 +307,9 @@ class TeacherInversionTrainer:
         # Convert to tensors
         import torchvision.transforms.functional as TF
 
-        pixel_values = torch.stack([TF.to_tensor(img) for img in images])  # [N, 3, H, W]
+        pixel_values = torch.stack(
+            [TF.to_tensor(img) for img in images]
+        )  # [N, 3, H, W]
         pixel_values = pixel_values * 2.0 - 1.0  # Normalize to [-1, 1]
         pixel_values = pixel_values.to(self.device, dtype=self.dtype)
 
@@ -321,6 +339,48 @@ class TeacherInversionTrainer:
         print(f"  ✓ Cached {len(latents)} packed latents: {latents.shape}")
         return latents
 
+    def create_center_weight_mask_packed(
+        self,
+        num_patches_h: int,
+        num_patches_w: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        sigma: float = 0.75,
+    ) -> torch.Tensor:
+        """
+        Create 2D Gaussian weight map for packed latents.
+
+        Args:
+            num_patches_h: Patch grid height (64 for 1024×1024)
+            num_patches_w: Patch grid width (64 for 1024×1024)
+            device: Target device
+            dtype: Target dtype
+            sigma: Gaussian spread (0.75 = moderate focus on center)
+
+        Returns:
+            Weight tensor [1, num_patches, 1] for broadcasting to [B, num_patches, C*4]
+
+        Notes:
+            - Creates Gaussian centered on image
+            - Weights range from 0.1 (edges) to 1.0 (center)
+            - Applied to MSE loss to focus on person regions
+        """
+        # Create coordinate grid from -1 to 1
+        y = torch.linspace(-1, 1, num_patches_h, device=device, dtype=dtype)
+        x = torch.linspace(-1, 1, num_patches_w, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+
+        # Gaussian centered at (0, 0)
+        weight_2d = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+
+        # Normalize to [0.1, 1.0] range (background=10%, center=100%)
+        weight_2d = 0.1 + 0.9 * weight_2d
+
+        # Flatten to match packed latent format [1, num_patches, 1]
+        weight = weight_2d.reshape(1, num_patches_h * num_patches_w, 1)
+
+        return weight
+
     def reparametrize(
         self,
         P: torch.Tensor,
@@ -341,9 +401,10 @@ class TeacherInversionTrainer:
                 - R: Slot-pure residual [1, S, H] with off-slot exactly zero
 
         Notes:
-            - Hard slot mask applied BEFORE normalization (gradients never flow to off-slot)
-            - RMS normalization on slot-only part prevents explosion/collapse in fp16/bf16
+            - Hard slot mask applied (gradients never flow to off-slot)
+            - Direct scaling without RMS normalization (allows P to control magnitude)
             - Scale is clamped to [0.01, 2.0] for stability
+            - RMS loss provides soft regularization toward target magnitude
         """
         # 1) Hard slot mask - zero out off-slot positions
         slot_mask = torch.zeros_like(P)
@@ -352,13 +413,9 @@ class TeacherInversionTrainer:
         # 2) Only keep slot parameters (off-slot becomes zero, no gradients flow there)
         P_slot = P * slot_mask
 
-        # 3) RMS normalization on slot part only
-        rms = compute_rms(P_slot, dim=None, eps=eps)
-        P_hat = P_slot / (rms + eps)
-
-        # 4) Apply scale
+        # 3) Apply scale (NO RMS normalization - allows P to directly control magnitude)
         scale = torch.exp(log_scale).clamp(0.01, 2.0)
-        R = scale * P_hat
+        R = scale * P_slot
 
         # 5) Safety: ensure off-slot stays exactly zero
         R = R * slot_mask
@@ -452,7 +509,9 @@ class TeacherInversionTrainer:
 
         # Convert timestep values to sigmas using direct formula
         # timestep = sigma * num_train_timesteps → sigma = timestep / num_train_timesteps
-        sigmas = timesteps.to(dtype=self.dtype, device=self.device) / num_train_timesteps
+        sigmas = (
+            timesteps.to(dtype=self.dtype, device=self.device) / num_train_timesteps
+        )
 
         # Note: We don't need to invert the shift transformation here because
         # timesteps already encode the shifted sigmas (computed in sample_timesteps)
@@ -488,7 +547,7 @@ class TeacherInversionTrainer:
         if weighting_scheme == "sigma_sqrt":
             # Inverse variance weighting (emphasizes low-noise timesteps)
             # Add epsilon for numerical stability (prevents division by zero)
-            weighting = (sigmas**2 + 1e-5)**-1.0
+            weighting = (sigmas**2 + 1e-5) ** -1.0
         elif weighting_scheme == "cosmap":
             # Cosine-based weighting from SD3 paper
             bot = 1 - 2 * sigmas + 2 * sigmas**2
@@ -596,7 +655,9 @@ class TeacherInversionTrainer:
                 )[0]
 
             # CFG combination
-            model_pred = model_pred_uncond + self.cfg_scale * (model_pred_cond - model_pred_uncond)
+            model_pred = model_pred_uncond + self.cfg_scale * (
+                model_pred_cond - model_pred_uncond
+            )
         else:
             model_pred = model_pred_cond
 
@@ -631,20 +692,42 @@ class TeacherInversionTrainer:
 
         Notes:
             - MSE: main noise prediction loss (weighted by timestep/sigma)
-            - RMS: light regularization (weight=0.1) - prevents scale extremes
+            - RMS: very light regularization (weight=0.01) - soft guidance toward target magnitude
             - Off-slot: forces residual to zero outside slot
         """
         if loss_weights is None:
-            loss_weights = {"mse": 1.0, "rms": 0.1, "offslot": 1.0}
+            loss_weights = {"mse": 1.0, "rms": 0.01, "offslot": 1.0}
 
         # MSE loss (main) with optional timestep weighting
         if sigmas is not None and weighting_scheme != "none":
             # Qwen-Image / SD3 approach: weight by sigma to prevent late timesteps from dominating
             loss_weighting = self.compute_loss_weights(sigmas, weighting_scheme)
 
-            # Compute per-sample weighted MSE
+            # Create spatial weight mask (cached, computed once)
+            if not hasattr(self, "_spatial_weight_mask"):
+                # Compute patch grid dimensions from image size
+                height_latent = self.image_height // 8 // 2  # VAE (÷8) + pack (÷2)
+                width_latent = self.image_width // 8 // 2
+                self._spatial_weight_mask = self.create_center_weight_mask_packed(
+                    num_patches_h=height_latent,
+                    num_patches_w=width_latent,
+                    device=pred.device,
+                    dtype=pred.dtype,
+                    sigma=0.65,
+                )
+                print(
+                    f"  ✓ Created spatial weight mask: {self._spatial_weight_mask.shape}"
+                )
+
+            spatial_weight = self._spatial_weight_mask  # [1, num_patches, 1]
+
+            # Compute per-sample weighted MSE with spatial masking
             mse_per_sample = (
-                (loss_weighting.float() * (pred.float() - target.float()) ** 2)
+                (
+                    loss_weighting.float()
+                    * spatial_weight.float()
+                    * (pred.float() - target.float()) ** 2
+                )
                 .reshape(pred.shape[0], -1)
                 .mean(dim=1)
             )
@@ -714,11 +797,11 @@ class TeacherInversionTrainer:
             else:
                 return None
 
-        with open(prompt_file, 'r') as f:
+        with open(prompt_file, "r") as f:
             full_prompt = f.read().strip()
 
         # Extract person description between "shot of " and ". (perfect"
-        match = re.search(r'shot of (.+?)\s*\.\s*\(perfect', full_prompt, re.DOTALL)
+        match = re.search(r"shot of (.+?)\s*\.\s*\(perfect", full_prompt, re.DOTALL)
         if match:
             person_desc = match.group(1).strip()
             return person_desc
@@ -753,7 +836,7 @@ class TeacherInversionTrainer:
 
         # First tokens (often subject: "60yo woman")
         if desc_len >= 2:
-            groups.append(E_desc[0, :min(4, desc_len), :].mean(dim=0, keepdim=True))
+            groups.append(E_desc[0, : min(4, desc_len), :].mean(dim=0, keepdim=True))
 
         # Middle tokens (often key features)
         if desc_len >= 6:
@@ -775,7 +858,7 @@ class TeacherInversionTrainer:
             return torch.zeros(1, self.S, self.H, device=self.device, dtype=self.dtype)
 
         # Compute residual at slot position
-        E_base_slot = self.E_base[0, self.s:self.s+self.L, :]  # [L, H]
+        E_base_slot = self.E_base[0, self.s : self.s + self.L, :]  # [L, H]
         R_slot = E_slot_init - E_base_slot  # [L, H]
 
         # Invert reparametrization: R → P
@@ -794,7 +877,7 @@ class TeacherInversionTrainer:
 
         # Create full P tensor (zeros everywhere except slot)
         P_init = torch.zeros(1, self.S, self.H, device=self.device, dtype=self.dtype)
-        P_init[0, self.s:self.s+self.L, :] = P_slot
+        P_init[0, self.s : self.s + self.L, :] = P_slot
 
         return P_init
 
@@ -805,7 +888,7 @@ class TeacherInversionTrainer:
         lr: float = 1e-4,
         batch_size: int = 2,
         grad_accum_steps: int = 4,
-        grad_clip: float = 5.0,
+        grad_clip: float = 2.0,
         loss_weights: Optional[Dict[str, float]] = None,
         timestep_sampling_scheme: str = "logit_normal",
         loss_weighting_scheme: str = "cosmap",
@@ -845,14 +928,20 @@ class TeacherInversionTrainer:
         # Try to initialize P from person description in prompt
         person_desc = self.load_and_parse_prompt(image_paths)
         if person_desc is not None:
-            print(f"  Initializing P from prompt: '{person_desc[:60]}{'...' if len(person_desc) > 60 else ''}'")
+            print(
+                f"  Initializing P from prompt: '{person_desc[:60]}{'...' if len(person_desc) > 60 else ''}'"
+            )
             P_init = self.compute_p_init_from_description(person_desc)
             P = torch.nn.Parameter(P_init.detach().clone()).requires_grad_(True)
         else:
             print("  No prompt found, using zero initialization")
-            P = torch.nn.Parameter(torch.zeros(1, self.S, self.H, device=self.device, dtype=self.dtype)).requires_grad_(True)
+            P = torch.nn.Parameter(
+                torch.zeros(1, self.S, self.H, device=self.device, dtype=self.dtype)
+            ).requires_grad_(True)
 
-        log_scale = torch.nn.Parameter(torch.tensor(0.0, device=self.device, dtype=self.dtype))
+        log_scale = torch.nn.Parameter(
+            torch.tensor(math.log(0.7), device=self.device, dtype=self.dtype)
+        )
 
         # Verify parameters are trainable
         print(f"  P.requires_grad: {P.requires_grad}")
@@ -862,7 +951,7 @@ class TeacherInversionTrainer:
         optimizer = torch.optim.AdamW([P, log_scale], lr=lr)
 
         # Learning rate scheduler with warmup
-        warmup_steps = int(steps * 0.15)  # 15% warmup (90 steps for 600 total)
+        warmup_steps = int(steps * 0.20)  # 20% warmup (120 steps for 600 total)
 
         def lr_lambda(step):
             if step < warmup_steps:
@@ -870,10 +959,17 @@ class TeacherInversionTrainer:
             return 1.0  # Constant after warmup
 
         from torch.optim.lr_scheduler import LambdaLR
+
         scheduler = LambdaLR(optimizer, lr_lambda)
+
+        # Initialize EMA (Exponential Moving Average) for smoother parameters
+        ema_decay = 0.9999
+        P_ema = P.data.clone().detach()
+        log_scale_ema = log_scale.data.clone().detach()
 
         # Training loop
         print(f"Training for {steps} steps...")
+        print(f"  EMA decay: {ema_decay}")
         print(f"  Images: {num_images}")
         print(f"  Batch size: {batch_size}")
         print(f"  Gradient accumulation: {grad_accum_steps}")
@@ -888,11 +984,20 @@ class TeacherInversionTrainer:
 
         pbar = tqdm(range(steps), desc="Training")
 
+        # Track parameter changes between steps
+        P_prev = None
+
         for step in pbar:
             # Zero gradients once per accumulation
             optimizer.zero_grad()
             accumulated_loss = 0.0
-            accumulated_losses = {"mse": 0.0, "rms": 0.0, "offslot": 0.0, "slot_rms": 0.0, "off_rms": 0.0}
+            accumulated_losses = {
+                "mse": 0.0,
+                "rms": 0.0,
+                "offslot": 0.0,
+                "slot_rms": 0.0,
+                "off_rms": 0.0,
+            }
 
             # Accumulate gradients over multiple micro-batches
             for k in range(grad_accum_steps):
@@ -951,10 +1056,15 @@ class TeacherInversionTrainer:
                 accumulated_losses[key] /= grad_accum_steps
 
             # Compute gradient norm BEFORE clipping (honest measurement)
-            total_norm = torch.norm(torch.stack([
-                torch.norm(P.grad.detach(), 2),
-                torch.norm(log_scale.grad.detach(), 2),
-            ]), 2).item()
+            total_norm = torch.norm(
+                torch.stack(
+                    [
+                        torch.norm(P.grad.detach(), 2),
+                        torch.norm(log_scale.grad.detach(), 2),
+                    ]
+                ),
+                2,
+            ).item()
 
             # Gradient clipping (only clip once)
             torch.nn.utils.clip_grad_norm_([P, log_scale], grad_clip)
@@ -964,10 +1074,30 @@ class TeacherInversionTrainer:
             optimizer.step()
             scheduler.step()  # Update learning rate
 
+            # Update EMA (after parameter update)
+            with torch.no_grad():
+                P_ema = ema_decay * P_ema + (1 - ema_decay) * P.data
+                log_scale_ema = ema_decay * log_scale_ema + (1 - ema_decay) * log_scale.data
+
+            # Compute parameter change for tracking
+            if P_prev is not None:
+                param_change = torch.norm(P.data - P_prev, p=2).item()
+                param_rms = torch.norm(P.data, p=2).item()
+                relative_change = param_change / (param_rms + 1e-8)
+            else:
+                param_change = 0.0
+                relative_change = 0.0
+
+            # Store current P for next iteration
+            P_prev = P.data.clone().detach()
+
             # Log detailed metrics every 10 steps
             if step % 10 == 0:
                 current_lr = scheduler.get_last_lr()[0]
                 current_scale = torch.exp(log_scale).clamp(0.01, 2.0).item()
+
+                # Compute EMA difference for monitoring
+                ema_diff = torch.norm(P.data - P_ema, p=2).item()
 
                 metric_entry = {
                     "step": step,
@@ -981,11 +1111,24 @@ class TeacherInversionTrainer:
                     "lr": current_lr,
                     "grad_norm": total_norm,
                     "was_clipped": bool(was_clipped),
+                    "param_change": param_change,
+                    "param_change_rel": relative_change,
+                    "ema_diff": ema_diff,
                 }
+
+                # Print detailed progress every 10 steps
+                print(
+                    f"  Step {step:3d} | Loss: {avg_loss:.4f} | "
+                    f"Δparam: {param_change:.4f} ({relative_change:.1%}) | "
+                    f"EMA-diff: {ema_diff:.4f} | "
+                    f"scale: {current_scale:.3f}"
+                )
                 metrics_log.append(metric_entry)
 
             # Check for NaN/Inf (use averaged loss)
-            if torch.isnan(torch.tensor(avg_loss)) or torch.isinf(torch.tensor(avg_loss)):
+            if torch.isnan(torch.tensor(avg_loss)) or torch.isinf(
+                torch.tensor(avg_loss)
+            ):
                 print(
                     f"\nERROR: NaN or Inf detected at step {step}.\n"
                     f"  Loss: {avg_loss:.4f}\n"
@@ -1008,19 +1151,33 @@ class TeacherInversionTrainer:
                     "scale": f"{torch.exp(log_scale).item():.3f}",
                     "slot_rms": f"{accumulated_losses['slot_rms']:.3f}",
                     "off_rms": f"{accumulated_losses['off_rms']:.6f}",
+                    "Δparam": f"{param_change:.4f}",
                 }
             )
 
             # Generate intermediate QA grid at step 100
             if step == 100:
-                print(f"\n  Generating intermediate QA grid (step {step})...")
+                print(f"\n  Generating intermediate QA grid (step {step}) with EMA...")
                 with torch.no_grad():
+                    # Temporarily swap to EMA parameters for smoother QA results
+                    P_backup = P.data.clone()
+                    log_scale_backup = log_scale.data.clone()
+
+                    P.data = P_ema.clone()
+                    log_scale.data = log_scale_ema.clone()
+
                     E_checkpoint, _ = self.reparametrize(P, log_scale)
                     E_checkpoint = E_checkpoint.detach()
 
+                    # Restore training parameters
+                    P.data = P_backup
+                    log_scale.data = log_scale_backup
+
                 # Use output directory for intermediate QA
                 if output_dir is None:
-                    raise ValueError("output_dir must be provided for intermediate QA generation at step 100")
+                    raise ValueError(
+                        "output_dir must be provided for intermediate QA generation at step 100"
+                    )
                 qa_dir = output_dir / f"qa_step{step}"
                 qa_dir.mkdir(exist_ok=True, parents=True)
 
@@ -1047,7 +1204,10 @@ class TeacherInversionTrainer:
             # Check for divergence
             if step > 50:
                 recent_losses = loss_history[-50:]
-                if all(recent_losses[i] > recent_losses[i - 1] for i in range(1, len(recent_losses))):
+                if all(
+                    recent_losses[i] > recent_losses[i - 1]
+                    for i in range(1, len(recent_losses))
+                ):
                     print(
                         f"\nERROR: Loss diverging (increasing for 50 consecutive steps).\n"
                         f"  Current loss: {avg_loss:.4f}\n"
@@ -1060,10 +1220,22 @@ class TeacherInversionTrainer:
         print(f"\n✓ Training complete. Best loss: {best_loss:.4f}")
         print()
 
-        # Final metrics
+        # Final metrics with EMA parameters (for smoother results)
+        print("  Using EMA parameters for final evaluation...")
         with torch.no_grad():
+            # Temporarily swap to EMA parameters
+            P_backup = P.data.clone()
+            log_scale_backup = log_scale.data.clone()
+
+            P.data = P_ema.clone()
+            log_scale.data = log_scale_ema.clone()
+
             E_final, R_final = self.reparametrize(P, log_scale)
             final_rms = compute_slot_off_slot_rms(R_final, self.s, self.L)
+
+            # Restore training parameters
+            P.data = P_backup
+            log_scale.data = log_scale_backup
 
         metrics = {
             "steps_completed": step + 1,
